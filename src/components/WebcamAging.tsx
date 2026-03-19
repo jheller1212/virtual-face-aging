@@ -75,6 +75,13 @@ export default function WebcamAging() {
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        // Wait for metadata to load so videoWidth/videoHeight are available
+        await new Promise<void>((resolve) => {
+          const v = videoRef.current!;
+          v.onloadedmetadata = () => resolve();
+          // If metadata already loaded
+          if (v.readyState >= 1) resolve();
+        });
         await videoRef.current.play();
       }
       setCameraOn(true);
@@ -150,19 +157,23 @@ export default function WebcamAging() {
         octx.clearRect(0, 0, w, h);
         const landmarker = landmarkerRef.current;
         if (landmarker) {
-          const result = landmarker.detectForVideo(video, performance.now());
+          try {
+            const result = landmarker.detectForVideo(video, performance.now());
 
-          if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-            const landmarks = result.faceLandmarks[0];
-            const factor = ageIntensity / 100;
+            if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+              const landmarks = result.faceLandmarks[0];
+              const factor = ageIntensity / 100;
 
-            if (showWrinkles) {
-              drawWrinkles(octx, landmarks, w, h, factor);
+              if (showWrinkles) {
+                drawWrinkles(octx, landmarks, w, h, factor);
+              }
+
+              if (showHairGreying) {
+                drawHairGreying(ctx, landmarks, w, h, factor);
+              }
             }
-
-            if (showHairGreying) {
-              drawHairGreying(ctx, landmarks, w, h, factor);
-            }
+          } catch {
+            // Face detection failed for this frame — video still renders
           }
         }
       }
@@ -300,7 +311,7 @@ export default function WebcamAging() {
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
             {cameraOn ? (
               <div className="relative">
-                <video ref={videoRef} className="hidden" playsInline muted />
+                <video ref={videoRef} className="absolute w-0 h-0 opacity-0" playsInline muted />
                 <canvas ref={canvasRef} className="max-w-full rounded-lg" />
                 <canvas ref={overlayCanvasRef} className="absolute top-0 left-0 max-w-full rounded-lg" />
               </div>
