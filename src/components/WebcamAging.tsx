@@ -1,5 +1,10 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import {
+  bootstrapCameraKit,
+  createMediaStreamSource,
+  Transform2D,
+} from '@snap/camera-kit';
+import type { CameraKit, CameraKitSession, Lens } from '@snap/camera-kit';
 import {
   Camera, CameraOff, Loader2, SlidersHorizontal, Download,
   HelpCircle, AlertCircle,
@@ -17,196 +22,144 @@ function Tooltip({ text }: { text: string }) {
   );
 }
 
+// Use staging token for localhost, production for deployed
+const API_TOKEN = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? import.meta.env.VITE_SNAP_STAGING_TOKEN ?? ''
+  : import.meta.env.VITE_SNAP_PRODUCTION_TOKEN ?? '';
+
+const LENS_GROUP_ID = import.meta.env.VITE_SNAP_LENS_GROUP_ID ?? '28a68bc3-4c98-421f-b6c3-7febcf6867b7';
+
 export default function WebcamAging() {
-  const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animFrameRef = useRef<number>(0);
-  const landmarkerRef = useRef<FaceLandmarker | null>(null);
+  const cameraKitRef = useRef<CameraKit | null>(null);
+  const sessionRef = useRef<CameraKitSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const cameraOnRef = useRef(false);
 
   const [cameraOn, setCameraOn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [modelReady, setModelReady] = useState(false);
-  const [ageIntensity, setAgeIntensity] = useState(50);
-  const [showWrinkles, setShowWrinkles] = useState(true);
-  const [showHairGreying, setShowHairGreying] = useState(true);
-  const [showSkinAging, setShowSkinAging] = useState(true);
+  const [sdkReady, setSdkReady] = useState(false);
+  const [lenses, setLenses] = useState<Lens[]>([]);
+  const [activeLensIdx, setActiveLensIdx] = useState(0);
+  const [noToken, setNoToken] = useState(false);
 
-  // Keep refs in sync for use inside render loop
-  const ageIntensityRef = useRef(ageIntensity);
-  const showWrinklesRef = useRef(showWrinkles);
-  const showHairGreyingRef = useRef(showHairGreying);
-  const showSkinAgingRef = useRef(showSkinAging);
-  useEffect(() => { ageIntensityRef.current = ageIntensity; }, [ageIntensity]);
-  useEffect(() => { showWrinklesRef.current = showWrinkles; }, [showWrinkles]);
-  useEffect(() => { showHairGreyingRef.current = showHairGreying; }, [showHairGreying]);
-  useEffect(() => { showSkinAgingRef.current = showSkinAging; }, [showSkinAging]);
-
-  // Initialize MediaPipe
+  // Initialize Camera Kit SDK
   useEffect(() => {
+    if (!API_TOKEN) {
+      setNoToken(true);
+      return;
+    }
+
     let cancelled = false;
     (async () => {
       try {
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
-        );
-        const landmarker = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-            delegate: 'GPU',
-          },
-          runningMode: 'VIDEO',
-          numFaces: 1,
-          outputFaceBlendshapes: false,
-          outputFacialTransformationMatrixes: false,
-        });
+        const cameraKit = await bootstrapCameraKit({ apiToken: API_TOKEN });
+        if (cancelled) return;
+        cameraKitRef.current = cameraKit;
+
+        // Load lenses from group
+        const result = await cameraKit.lensRepository.loadLensGroups([LENS_GROUP_ID]);
+        if (cancelled) return;
+        // loadLensGroups returns Lens[] or { lenses: Lens[] } depending on version
+        const loadedLenses = Array.isArray(result) ? result : (result as { lenses: Lens[] }).lenses ?? [];
+        setLenses(loadedLenses);
+        setSdkReady(true);
+      } catch (err) {
         if (!cancelled) {
-          landmarkerRef.current = landmarker;
-          setModelReady(true);
-        }
-      } catch {
-        if (!cancelled) {
-          setError('Failed to load face detection model. Check your internet connection.');
+          setError(`Failed to initialize Snap Camera Kit: ${err instanceof Error ? err.message : 'Unknown error'}`);
         }
       }
     })();
+
     return () => { cancelled = true; };
   }, []);
 
-  const startRenderLoop = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const overlay = overlayCanvasRef.current;
-    if (!video || !canvas || !overlay) return;
-
-    const ctx = canvas.getContext('2d');
-    const octx = overlay.getContext('2d');
-    if (!ctx || !octx) return;
-
-    let lastTime = -1;
-
-    const render = () => {
-      if (!cameraOnRef.current) return;
-
-      if (video.readyState >= 2 && video.currentTime !== lastTime) {
-        lastTime = video.currentTime;
-        const w = video.videoWidth;
-        const h = video.videoHeight;
-
-        if (w > 0 && h > 0) {
-          canvas.width = w;
-          canvas.height = h;
-          overlay.width = w;
-          overlay.height = h;
-
-          // Draw video frame
-          ctx.drawImage(video, 0, 0, w, h);
-
-          const intensity = ageIntensityRef.current;
-          const factor = intensity / 100;
-
-          // Apply skin aging effect
-          if (showSkinAgingRef.current && factor > 0) {
-            const imageData = ctx.getImageData(0, 0, w, h);
-            const d = imageData.data;
-            const blend = factor * 0.35;
-            for (let i = 0; i < d.length; i += 4) {
-              const grey = d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
-              d[i] = d[i] * (1 - blend) + (grey + 8) * blend;
-              d[i + 1] = d[i + 1] * (1 - blend) + (grey - 2) * blend;
-              d[i + 2] = d[i + 2] * (1 - blend) + (grey - 6) * blend;
-            }
-            ctx.putImageData(imageData, 0, 0);
-          }
-
-          // Detect face landmarks and draw effects
-          octx.clearRect(0, 0, w, h);
-          const landmarker = landmarkerRef.current;
-          if (landmarker) {
-            try {
-              const result = landmarker.detectForVideo(video, performance.now());
-              if (result.faceLandmarks && result.faceLandmarks.length > 0) {
-                const landmarks = result.faceLandmarks[0];
-                if (showWrinklesRef.current) {
-                  drawWrinkles(octx, landmarks, w, h, factor);
-                }
-                if (showHairGreyingRef.current) {
-                  drawHairGreying(ctx, landmarks, w, h, factor);
-                }
-              }
-            } catch {
-              // Face detection failed for this frame — video still renders
-            }
-          }
-        }
-      }
-
-      animFrameRef.current = requestAnimationFrame(render);
-    };
-
-    animFrameRef.current = requestAnimationFrame(render);
-  }, []);
-
   const startCamera = useCallback(async () => {
+    if (!cameraKitRef.current || !canvasRef.current) return;
+
     setLoading(true);
     setError(null);
+
     try {
+      const cameraKit = cameraKitRef.current;
+
+      // Create session
+      const session = await cameraKit.createSession({
+        liveRenderTarget: canvasRef.current,
+      });
+      sessionRef.current = session;
+
+      // Set canvas size
+      canvasRef.current.width = 640;
+      canvasRef.current.height = 480;
+
+      // Get webcam stream
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: 'user' },
       });
       streamRef.current = stream;
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        await new Promise<void>((resolve) => {
-          video.onloadedmetadata = () => resolve();
-          if (video.readyState >= 1) resolve();
-        });
-        await video.play();
+
+      // Connect webcam to Camera Kit — mirror the front camera
+      const source = createMediaStreamSource(stream, {
+        transform: Transform2D.MirrorX,
+        cameraType: 'user',
+      });
+      await session.setSource(source);
+
+      // Apply first lens if available
+      if (lenses.length > 0) {
+        await session.applyLens(lenses[0]);
+        setActiveLensIdx(0);
       }
-      cameraOnRef.current = true;
+
+      // Start rendering
+      await session.play();
+
       setCameraOn(true);
-      startRenderLoop();
-    } catch {
-      setError('Camera access denied. Please allow camera permissions.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start camera.');
     } finally {
       setLoading(false);
     }
-  }, [startRenderLoop]);
+  }, [lenses]);
 
   const stopCamera = useCallback(() => {
-    cameraOnRef.current = false;
-    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    sessionRef.current?.pause();
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
+    sessionRef.current = null;
     setCameraOn(false);
+  }, []);
+
+  const switchLens = useCallback(async (idx: number) => {
+    if (!sessionRef.current || !lenses[idx]) return;
+    try {
+      await sessionRef.current.applyLens(lenses[idx]);
+      setActiveLensIdx(idx);
+    } catch {
+      setError('Failed to switch lens.');
+    }
+  }, [lenses]);
+
+  const removeLens = useCallback(async () => {
+    if (!sessionRef.current) return;
+    await sessionRef.current.removeLens();
+    setActiveLensIdx(-1);
   }, []);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      cameraOnRef.current = false;
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      sessionRef.current?.pause();
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
   const handleCapture = () => {
     const canvas = canvasRef.current;
-    const overlay = overlayCanvasRef.current;
-    if (!canvas || !overlay) return;
+    if (!canvas) return;
 
-    const out = document.createElement('canvas');
-    out.width = canvas.width;
-    out.height = canvas.height;
-    const outCtx = out.getContext('2d')!;
-    outCtx.drawImage(canvas, 0, 0);
-    outCtx.drawImage(overlay, 0, 0);
-
-    out.toBlob((blob) => {
+    canvas.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -217,6 +170,19 @@ export default function WebcamAging() {
     });
   };
 
+  if (noToken) {
+    return (
+      <div className="bg-amber-50 border border-amber-200 rounded-2xl p-8 text-center space-y-3">
+        <AlertCircle className="w-8 h-8 mx-auto text-amber-500" />
+        <h3 className="text-lg font-semibold text-slate-800">Snap Camera Kit not configured</h3>
+        <p className="text-sm text-slate-600 max-w-lg mx-auto">
+          The live webcam aging feature requires a Snap Camera Kit API token. Add your tokens to the
+          environment variables <code className="px-1.5 py-0.5 bg-amber-100 rounded text-xs">VITE_SNAP_STAGING_TOKEN</code> and <code className="px-1.5 py-0.5 bg-amber-100 rounded text-xs">VITE_SNAP_PRODUCTION_TOKEN</code> to enable this feature.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -225,59 +191,72 @@ export default function WebcamAging() {
           <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5">
             <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
               <SlidersHorizontal className="w-4 h-4" />
-              Live Aging Controls
+              AR Lens Controls
             </div>
 
-            <div>
-              <div className="flex items-center justify-between text-sm mb-1.5">
-                <div className="flex items-center gap-2">
-                  <span className="text-slate-600">Aging intensity</span>
-                  <Tooltip text="Controls how strongly all aging effects are applied to the live webcam feed. Higher values produce more visible wrinkles, skin changes, and hair greying." />
+            {/* Lens selector */}
+            {lenses.length > 0 && cameraOn && (
+              <div>
+                <div className="flex items-center gap-2 text-sm text-slate-600 mb-2">
+                  <span>Active lens</span>
+                  <Tooltip text="Select which AR aging lens to apply. Each lens provides a different aging style and intensity." />
                 </div>
-                <span className="font-medium text-slate-900">{ageIntensity}%</span>
+                <div className="flex flex-wrap gap-2">
+                  {lenses.map((lens, idx) => (
+                    <button
+                      key={lens.id}
+                      onClick={() => switchLens(idx)}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                        activeLensIdx === idx
+                          ? 'bg-amber-100 border-amber-300 text-amber-800'
+                          : 'bg-white border-slate-200 text-slate-600 hover:border-amber-300'
+                      }`}
+                    >
+                      {lens.name || `Lens ${idx + 1}`}
+                    </button>
+                  ))}
+                  <button
+                    onClick={removeLens}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                      activeLensIdx === -1
+                        ? 'bg-slate-100 border-slate-300 text-slate-800'
+                        : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'
+                    }`}
+                  >
+                    No filter
+                  </button>
+                </div>
               </div>
-              <input
-                type="range" min="0" max="100" value={ageIntensity}
-                onChange={(e) => setAgeIntensity(Number(e.target.value))}
-                className="w-full accent-amber-500"
-              />
-              <div className="flex justify-between text-xs text-slate-400 mt-0.5">
-                <span>None</span><span>Maximum</span>
-              </div>
-            </div>
+            )}
 
-            <div className="space-y-2">
-              <p className="text-sm text-slate-600">Effect layers</p>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={showWrinkles} onChange={(e) => setShowWrinkles(e.target.checked)}
-                  className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
-                <span className="text-sm text-slate-700">Wrinkles & lines</span>
-                <Tooltip text="Draws simulated wrinkle lines on the forehead, around the eyes (crow's feet), and along nasolabial folds based on detected facial landmarks." />
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={showHairGreying} onChange={(e) => setShowHairGreying(e.target.checked)}
-                  className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
-                <span className="text-sm text-slate-700">Hair greying</span>
-                <Tooltip text="Desaturates and lightens the hair region above the forehead to simulate greying or whitening hair." />
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" checked={showSkinAging} onChange={(e) => setShowSkinAging(e.target.checked)}
-                  className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
-                <span className="text-sm text-slate-700">Skin aging</span>
-                <Tooltip text="Desaturates and warms the overall skin tone to simulate aged, weathered skin." />
-              </label>
+            {lenses.length === 0 && sdkReady && (
+              <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
+                <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                <p className="text-xs text-amber-700">
+                  No lenses found in your lens group. Add an aging lens in the <a href="https://my-lenses.snapchat.com" target="_blank" rel="noopener noreferrer" className="underline">Snap Lens Scheduler</a> to enable AR effects.
+                </p>
+              </div>
+            )}
+
+            <div className="p-3 bg-slate-50 rounded-lg">
+              <p className="text-xs text-slate-500 leading-relaxed">
+                AR effects run entirely in your browser via Snap Camera Kit. No camera images are sent to any server. Face processing happens locally on this device.
+              </p>
             </div>
           </div>
 
+          {/* Camera buttons */}
           <div className="flex gap-3">
             {!cameraOn ? (
               <button
                 onClick={startCamera}
-                disabled={loading}
+                disabled={loading || !sdkReady}
                 className="flex-1 flex items-center justify-center gap-2 px-6 py-3 text-sm font-medium text-white bg-gradient-to-r from-amber-500 to-orange-500 rounded-xl hover:from-amber-400 hover:to-orange-400 disabled:opacity-50 disabled:cursor-not-allowed shadow-md transition-all"
               >
                 {loading ? (
                   <><Loader2 className="w-4 h-4 animate-spin" /> Starting camera...</>
+                ) : !sdkReady ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Loading AR engine...</>
                 ) : (
                   <><Camera className="w-4 h-4" /> Start Camera</>
                 )}
@@ -300,10 +279,10 @@ export default function WebcamAging() {
             )}
           </div>
 
-          {!modelReady && !error && (
+          {!sdkReady && !error && !noToken && (
             <div className="flex items-center gap-2 text-xs text-slate-400">
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Loading face detection model... (camera will work without it)
+              Initializing Snap Camera Kit...
             </div>
           )}
         </div>
@@ -311,16 +290,19 @@ export default function WebcamAging() {
         {/* Right: Video feed */}
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
-            <div className="relative" style={{ display: cameraOn ? 'block' : 'none' }}>
-              <video ref={videoRef} style={{ position: 'absolute', width: 0, height: 0, opacity: 0 }} playsInline muted />
-              <canvas ref={canvasRef} style={{ maxWidth: '100%', borderRadius: '0.5rem' }} />
-              <canvas ref={overlayCanvasRef} style={{ position: 'absolute', top: 0, left: 0, maxWidth: '100%', borderRadius: '0.5rem' }} />
-            </div>
+            <canvas
+              ref={canvasRef}
+              style={{
+                maxWidth: '100%',
+                borderRadius: '0.5rem',
+                display: cameraOn ? 'block' : 'none',
+              }}
+            />
             {!cameraOn && (
               <div className="text-center space-y-3">
                 <Camera className="w-10 h-10 mx-auto text-slate-200" />
-                <p className="text-sm text-slate-400">Click "Start Camera" to begin live aging</p>
-                <p className="text-xs text-slate-300">Requires camera permission. All processing happens locally — no API key needed.</p>
+                <p className="text-sm text-slate-400">Click "Start Camera" to begin live AR aging</p>
+                <p className="text-xs text-slate-300">Requires camera permission. All processing happens locally — no images leave your device.</p>
               </div>
             )}
           </div>
@@ -335,106 +317,4 @@ export default function WebcamAging() {
       )}
     </div>
   );
-}
-
-// ── Drawing helpers ──────────────────────────────────────────────────────────
-
-type Landmark = { x: number; y: number; z: number };
-
-function px(lm: Landmark, w: number): number { return lm.x * w; }
-function py(lm: Landmark, h: number): number { return lm.y * h; }
-
-function drawWrinkles(ctx: CanvasRenderingContext2D, lm: Landmark[], w: number, h: number, factor: number) {
-  const alpha = Math.min(factor * 0.7, 0.6);
-  ctx.strokeStyle = `rgba(80, 50, 30, ${alpha})`;
-  ctx.lineWidth = 1 + factor;
-  ctx.lineCap = 'round';
-
-  // Forehead wrinkles
-  const foreheadY1 = py(lm[10], h) - 15;
-  const foreheadY2 = py(lm[10], h) - 8;
-  const foreheadY3 = py(lm[10], h) - 1;
-  const leftX = px(lm[67], w) + 5;
-  const rightX = px(lm[297], w) - 5;
-
-  for (const y of [foreheadY1, foreheadY2, foreheadY3]) {
-    ctx.beginPath();
-    ctx.moveTo(leftX, y + Math.sin(leftX * 0.05) * 2);
-    const midX = (leftX + rightX) / 2;
-    ctx.quadraticCurveTo(midX, y - 3 + Math.sin(midX * 0.03) * 2, rightX, y + Math.sin(rightX * 0.05) * 2);
-    ctx.stroke();
-  }
-
-  // Crow's feet
-  const crowsFeetPairs = [
-    { outer: lm[33], dir: -1 },
-    { outer: lm[263], dir: 1 },
-  ];
-
-  for (const { outer, dir } of crowsFeetPairs) {
-    const ox = px(outer, w);
-    const oy = py(outer, h);
-    for (let i = -1; i <= 1; i++) {
-      ctx.beginPath();
-      ctx.moveTo(ox, oy);
-      ctx.lineTo(ox + dir * (8 + factor * 8), oy + i * (4 + factor * 3));
-      ctx.stroke();
-    }
-  }
-
-  // Nasolabial folds
-  const noseLeft = lm[48];
-  const noseRight = lm[278];
-  const mouthLeft = lm[61];
-  const mouthRight = lm[291];
-
-  ctx.lineWidth = 1.5 + factor;
-
-  ctx.beginPath();
-  ctx.moveTo(px(noseLeft, w), py(noseLeft, h));
-  ctx.quadraticCurveTo(px(noseLeft, w) - 5, (py(noseLeft, h) + py(mouthLeft, h)) / 2, px(mouthLeft, w) - 3, py(mouthLeft, h) + 4);
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.moveTo(px(noseRight, w), py(noseRight, h));
-  ctx.quadraticCurveTo(px(noseRight, w) + 5, (py(noseRight, h) + py(mouthRight, h)) / 2, px(mouthRight, w) + 3, py(mouthRight, h) + 4);
-  ctx.stroke();
-
-  // Under-eye lines
-  ctx.lineWidth = 0.8 + factor * 0.5;
-  ctx.strokeStyle = `rgba(100, 70, 50, ${alpha * 0.6})`;
-
-  for (const idx of [159, 386]) {
-    const ux = px(lm[idx], w);
-    const uy = py(lm[idx], h) + 4;
-    ctx.beginPath();
-    ctx.moveTo(ux - 10, uy);
-    ctx.quadraticCurveTo(ux, uy + 3, ux + 10, uy);
-    ctx.stroke();
-  }
-}
-
-function drawHairGreying(ctx: CanvasRenderingContext2D, lm: Landmark[], w: number, h: number, factor: number) {
-  const foreheadTop = Math.max(0, py(lm[10], h) - 60);
-  const foreheadBottom = py(lm[10], h) - 5;
-  const leftBound = Math.max(0, px(lm[67], w) - 20);
-  const rightBound = Math.min(w, px(lm[297], w) + 20);
-
-  const regionW = rightBound - leftBound;
-  const regionH = foreheadBottom - foreheadTop;
-  if (regionW <= 0 || regionH <= 0) return;
-
-  const imageData = ctx.getImageData(leftBound, foreheadTop, regionW, regionH);
-  const d = imageData.data;
-  const blend = factor * 0.5;
-
-  for (let i = 0; i < d.length; i += 4) {
-    const grey = d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
-    const lightGrey = grey + (255 - grey) * factor * 0.4;
-    d[i] = d[i] * (1 - blend) + lightGrey * blend;
-    d[i + 1] = d[i + 1] * (1 - blend) + lightGrey * blend;
-    d[i + 2] = d[i + 2] * (1 - blend) + lightGrey * blend;
-  }
-
-  ctx.putImageData(imageData, leftBound, foreheadTop);
 }
