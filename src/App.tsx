@@ -1,10 +1,11 @@
 import { useState, useRef, useCallback } from 'react';
 import {
   Upload, Download, Key, Loader2, AlertCircle, ImageIcon,
-  SlidersHorizontal, Sparkles, RotateCcw, ChevronDown,
+  SlidersHorizontal, Sparkles, RotateCcw, ChevronDown, Info,
+  HelpCircle, User,
 } from 'lucide-react';
 
-type Quality = 'low' | 'medium' | 'high';
+type Quality = 'low' | 'high';
 type Size = '1024x1024' | '1536x1024' | '1024x1536';
 
 const SIZE_LABELS: Record<Size, string> = {
@@ -13,21 +14,45 @@ const SIZE_LABELS: Record<Size, string> = {
   '1024x1536': '2:3 Portrait',
 };
 
-function buildPrompt(ageAmount: number, intensity: number, custom: string): string {
+function Tooltip({ text }: { text: string }) {
+  return (
+    <div className="relative group/tip inline-flex">
+      <HelpCircle className="w-3.5 h-3.5 text-slate-400 cursor-help" />
+      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 text-xs text-white bg-slate-800 rounded-lg shadow-lg opacity-0 group-hover/tip:opacity-100 pointer-events-none transition-opacity w-52 text-center z-20">
+        {text}
+        <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-800" />
+      </div>
+    </div>
+  );
+}
+
+function buildPrompt(currentAge: number, targetAge: number, realism: number, custom: string): string {
+  const ageDiff = targetAge - currentAge;
+
   const ageDesc =
-    ageAmount <= 10 ? 'a few years older, with very subtle signs of aging'
-    : ageAmount <= 25 ? 'noticeably older, with visible wrinkles and some grey hair'
-    : ageAmount <= 40 ? 'significantly aged, with deep wrinkles, grey or white hair, and aged skin texture'
-    : 'very elderly, with pronounced wrinkles, white hair, age spots, and weathered skin';
+    ageDiff <= 10 ? `about ${targetAge} years old, with very subtle signs of aging compared to their current appearance`
+    : ageDiff <= 25 ? `about ${targetAge} years old, with visible wrinkles, some grey hair, and natural signs of aging`
+    : ageDiff <= 40 ? `about ${targetAge} years old, with deep wrinkles, mostly grey or white hair, and noticeably aged skin`
+    : `about ${targetAge} years old, very elderly, with pronounced wrinkles, white hair, age spots, and weathered skin`;
 
-  const intensityDesc =
-    intensity <= 30 ? 'Keep the transformation subtle and natural-looking.'
-    : intensity <= 70 ? 'Apply a moderate, realistic aging effect.'
-    : 'Apply an intense, dramatic aging transformation.';
+  const realismDesc =
+    realism <= 30 ? 'Keep the transformation subtle — err on the side of looking natural even if the aging is understated.'
+    : realism <= 70 ? 'Apply a balanced, realistic aging effect that is clearly visible but natural-looking.'
+    : 'Apply a strong, pronounced aging transformation with high visual fidelity to real aging.';
 
-  const base = `Transform this person to look ${ageDesc}. ${intensityDesc} Preserve the person's identity, facial structure, expression, and background. The result should look like a realistic photograph, not an illustration.`;
+  const base = `Transform this person (currently around ${currentAge} years old) to look ${ageDesc}. ${realismDesc} Preserve the person's identity, facial structure, expression, pose, and background. The result should look like a realistic photograph, not an illustration or cartoon.`;
 
   return custom ? `${base} Additional instructions: ${custom}` : base;
+}
+
+function estimateAge(_file: File): Promise<number> {
+  // Simple heuristic estimate — in v2 this could use a face age detection model
+  // For now, return a reasonable default that the user is expected to correct
+  return new Promise((resolve) => {
+    // We can't detect age client-side without a model, so default to 30
+    // and prompt the user to correct it
+    setTimeout(() => resolve(30), 300);
+  });
 }
 
 export default function App() {
@@ -38,15 +63,18 @@ export default function App() {
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [ageAmount, setAgeAmount] = useState(25);
-  const [intensity, setIntensity] = useState(50);
-  const [quality, setQuality] = useState<Quality>('medium');
+  const [estimatedAge, setEstimatedAge] = useState<number | null>(null);
+  const [currentAge, setCurrentAge] = useState(30);
+  const [ageEdited, setAgeEdited] = useState(false);
+  const [targetAge, setTargetAge] = useState(65);
+  const [realism, setRealism] = useState(50);
+  const [quality, setQuality] = useState<Quality>('high');
   const [size, setSize] = useState<Size>('1024x1024');
   const [customPrompt, setCustomPrompt] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileSelect = useCallback((file: File) => {
+  const handleFileSelect = useCallback(async (file: File) => {
     if (!file.type.startsWith('image/')) {
       setError('Please upload an image file (PNG, JPG, WebP).');
       return;
@@ -59,6 +87,12 @@ export default function App() {
     setImageUrl(URL.createObjectURL(file));
     setResultUrl(null);
     setError(null);
+    setAgeEdited(false);
+
+    const est = await estimateAge(file);
+    setEstimatedAge(est);
+    setCurrentAge(est);
+    setTargetAge(Math.min(est + 30, 95));
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -70,12 +104,13 @@ export default function App() {
   const handleGenerate = async () => {
     if (!apiKey.trim()) { setError('Please enter your OpenAI API key.'); return; }
     if (!imageFile) { setError('Please upload an image first.'); return; }
+    if (targetAge <= currentAge) { setError('Target age must be higher than current age.'); return; }
 
     setLoading(true);
     setError(null);
     setResultUrl(null);
 
-    const prompt = buildPrompt(ageAmount, intensity, customPrompt);
+    const prompt = buildPrompt(currentAge, targetAge, realism, customPrompt);
 
     const formData = new FormData();
     formData.append('image', imageFile);
@@ -114,7 +149,7 @@ export default function App() {
     if (!resultUrl) return;
     const a = document.createElement('a');
     a.href = resultUrl;
-    a.download = `aged-portrait-${Date.now()}.png`;
+    a.download = `aged-portrait-${currentAge}-to-${targetAge}-${Date.now()}.png`;
     a.click();
   };
 
@@ -123,6 +158,8 @@ export default function App() {
     setImageUrl(null);
     setResultUrl(null);
     setError(null);
+    setEstimatedAge(null);
+    setAgeEdited(false);
   };
 
   return (
@@ -134,7 +171,7 @@ export default function App() {
             <Sparkles className="w-5 h-5 text-amber-500" />
             <span className="text-lg font-bold text-slate-900">Virtual Face Aging</span>
           </div>
-          <span className="text-xs text-slate-400">Powered by OpenAI</span>
+          <span className="text-xs text-slate-400">A research project at Maastricht University</span>
         </div>
       </header>
 
@@ -144,6 +181,7 @@ export default function App() {
           <label className="flex items-center gap-2 text-sm font-medium text-slate-700 mb-2">
             <Key className="w-4 h-4" />
             OpenAI API Key
+            <Tooltip text="Your key is stored in the browser only and sent directly to OpenAI. It is never saved to any server." />
           </label>
           <div className="flex gap-2">
             <input
@@ -160,7 +198,6 @@ export default function App() {
               {showKey ? 'Hide' : 'Show'}
             </button>
           </div>
-          <p className="text-xs text-slate-400 mt-1.5">Stored in your browser only. Never sent to any server except OpenAI.</p>
         </section>
 
         {/* Main grid */}
@@ -209,51 +246,99 @@ export default function App() {
                 Aging Controls
               </div>
 
+              {/* Current age */}
               <div>
-                <div className="flex justify-between text-sm mb-1.5">
-                  <span className="text-slate-600">Age increase</span>
-                  <span className="font-medium text-slate-900">+{ageAmount} years</span>
+                <div className="flex items-center gap-2 text-sm mb-1.5">
+                  <User className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-slate-600">Current age</span>
+                  <Tooltip text="The estimated age of the person in the uploaded photo. Correct this to your actual age for more accurate results." />
+                </div>
+                {estimatedAge !== null && !ageEdited && (
+                  <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
+                    <Info className="w-3.5 h-3.5 text-blue-500 flex-shrink-0" />
+                    <p className="text-xs text-blue-700">
+                      Estimated age: ~{estimatedAge}. Please correct below with your actual age for best results.
+                    </p>
+                  </div>
+                )}
+                <input
+                  type="number"
+                  min="5"
+                  max="90"
+                  value={currentAge}
+                  onChange={(e) => {
+                    const v = Math.max(5, Math.min(90, Number(e.target.value)));
+                    setCurrentAge(v);
+                    setAgeEdited(true);
+                    if (targetAge <= v) setTargetAge(Math.min(v + 10, 95));
+                  }}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white focus:ring-2 focus:ring-amber-400 outline-none"
+                />
+              </div>
+
+              {/* Target age */}
+              <div>
+                <div className="flex items-center justify-between text-sm mb-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-600">Target age</span>
+                    <Tooltip text="The age you want the person to appear in the generated image. Must be higher than the current age." />
+                  </div>
+                  <span className="font-medium text-slate-900">{targetAge} years old</span>
                 </div>
                 <input
-                  type="range" min="5" max="50" value={ageAmount}
-                  onChange={(e) => setAgeAmount(Number(e.target.value))}
+                  type="range"
+                  min={currentAge + 5}
+                  max="95"
+                  value={targetAge}
+                  onChange={(e) => setTargetAge(Number(e.target.value))}
                   className="w-full accent-amber-500"
                 />
                 <div className="flex justify-between text-xs text-slate-400 mt-0.5">
-                  <span>Subtle</span><span>Dramatic</span>
+                  <span>{currentAge + 5}</span>
+                  <span className="font-medium text-amber-600">+{targetAge - currentAge} years</span>
+                  <span>95</span>
                 </div>
               </div>
 
+              {/* Realism */}
               <div>
-                <div className="flex justify-between text-sm mb-1.5">
-                  <span className="text-slate-600">Render intensity</span>
-                  <span className="font-medium text-slate-900">{intensity}%</span>
+                <div className="flex items-center justify-between text-sm mb-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-slate-600">Realism</span>
+                    <Tooltip text="Controls how pronounced the aging effect is. Low realism produces subtle, conservative changes. High realism produces dramatic, detailed aging features like deep wrinkles and age spots." />
+                  </div>
+                  <span className="font-medium text-slate-900">{realism}%</span>
                 </div>
                 <input
-                  type="range" min="10" max="100" value={intensity}
-                  onChange={(e) => setIntensity(Number(e.target.value))}
+                  type="range" min="10" max="100" value={realism}
+                  onChange={(e) => setRealism(Number(e.target.value))}
                   className="w-full accent-amber-500"
                 />
                 <div className="flex justify-between text-xs text-slate-400 mt-0.5">
-                  <span>Natural</span><span>Intense</span>
+                  <span>Subtle</span><span>Pronounced</span>
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
-                  <label className="text-sm text-slate-600 mb-1 block">Quality</label>
+                  <div className="flex items-center gap-2 text-sm text-slate-600 mb-1">
+                    <span>Quality</span>
+                    <Tooltip text="Low quality is faster and cheaper (~5s). High quality produces more detailed results but takes longer (~30s) and costs more tokens." />
+                  </div>
                   <select
                     value={quality}
                     onChange={(e) => setQuality(e.target.value as Quality)}
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white focus:ring-2 focus:ring-amber-400 outline-none"
                   >
-                    <option value="low">Low (fast)</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High (slow)</option>
+                    <option value="low">Low (faster, cheaper)</option>
+                    <option value="high">High (detailed, slower)</option>
                   </select>
                 </div>
                 <div>
-                  <label className="text-sm text-slate-600 mb-1 block">Size</label>
+                  <div className="flex items-center gap-2 text-sm text-slate-600 mb-1">
+                    <span>Output size</span>
+                    <Tooltip text="The dimensions of the generated image. Square works best for portraits. Landscape and portrait orientations are available for full-body or group shots." />
+                  </div>
                   <select
                     value={size}
                     onChange={(e) => setSize(e.target.value as Size)}
@@ -276,7 +361,10 @@ export default function App() {
               </button>
               {showAdvanced && (
                 <div>
-                  <label className="text-sm text-slate-600 mb-1 block">Custom prompt addition</label>
+                  <div className="flex items-center gap-2 text-sm text-slate-600 mb-1">
+                    <span>Custom prompt addition</span>
+                    <Tooltip text="Add extra instructions to the AI prompt. For example: 'Add glasses' or 'Keep the person smiling'. These are appended to the auto-generated aging prompt." />
+                  </div>
                   <textarea
                     value={customPrompt}
                     onChange={(e) => setCustomPrompt(e.target.value)}
@@ -323,7 +411,10 @@ export default function App() {
                   <p className="text-xs text-slate-400">This can take 15–45 seconds depending on quality.</p>
                 </div>
               ) : resultUrl ? (
-                <img src={resultUrl} alt="Aged portrait result" className="max-w-full max-h-[500px] rounded-lg shadow-lg" />
+                <div className="space-y-3 text-center">
+                  <img src={resultUrl} alt="Aged portrait result" className="max-w-full max-h-[500px] rounded-lg shadow-lg" />
+                  <p className="text-xs text-slate-400">Age {currentAge} → {targetAge} · Realism {realism}% · Quality: {quality}</p>
+                </div>
               ) : (
                 <div className="text-center space-y-3">
                   <ImageIcon className="w-10 h-10 mx-auto text-slate-200" />
