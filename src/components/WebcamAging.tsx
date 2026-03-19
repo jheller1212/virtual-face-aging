@@ -1,20 +1,13 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
 import {
-  bootstrapCameraKit,
-  createMediaStreamSource,
-  Transform2D,
-} from '@snap/camera-kit';
-import type { CameraKit, CameraKitSession, Lens } from '@snap/camera-kit';
-import {
-  Camera, CameraOff, Loader2, SlidersHorizontal, Download,
-  HelpCircle, AlertCircle,
+  Camera, CameraOff, Loader2, Download, HelpCircle, AlertCircle, MonitorSmartphone,
 } from 'lucide-react';
 
 function Tooltip({ text }: { text: string }) {
   return (
     <div className="relative group/tip inline-flex">
       <HelpCircle className="w-3.5 h-3.5 text-slate-400 cursor-help" />
-      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 text-xs text-white bg-slate-800 rounded-lg shadow-lg opacity-0 group-hover/tip:opacity-100 pointer-events-none transition-opacity w-52 text-center z-20">
+      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 text-xs text-white bg-slate-800 rounded-lg shadow-lg opacity-0 group-hover/tip:opacity-100 pointer-events-none transition-opacity w-56 text-center z-20">
         {text}
         <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-800" />
       </div>
@@ -22,225 +15,193 @@ function Tooltip({ text }: { text: string }) {
   );
 }
 
-// Use staging token for localhost, production for deployed
-const API_TOKEN = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? import.meta.env.VITE_SNAP_STAGING_TOKEN ?? ''
-  : import.meta.env.VITE_SNAP_PRODUCTION_TOKEN ?? '';
-
-const LENS_GROUP_ID = import.meta.env.VITE_SNAP_LENS_GROUP_ID ?? '28a68bc3-4c98-421f-b6c3-7febcf6867b7';
+interface CameraDevice {
+  deviceId: string;
+  label: string;
+}
 
 export default function WebcamAging() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const cameraKitRef = useRef<CameraKit | null>(null);
-  const sessionRef = useRef<CameraKitSession | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [cameraOn, setCameraOn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sdkReady, setSdkReady] = useState(false);
-  const [lenses, setLenses] = useState<Lens[]>([]);
-  const [activeLensIdx, setActiveLensIdx] = useState(0);
-  const [noToken, setNoToken] = useState(false);
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [selectedCamera, setSelectedCamera] = useState<string>('');
+  const [hasSnapCamera, setHasSnapCamera] = useState(false);
 
-  // Initialize Camera Kit SDK
+  // Enumerate cameras on mount
   useEffect(() => {
-    if (!API_TOKEN) {
-      setNoToken(true);
-      return;
-    }
-
-    let cancelled = false;
     (async () => {
       try {
-        const cameraKit = await bootstrapCameraKit({ apiToken: API_TOKEN });
-        if (cancelled) return;
-        cameraKitRef.current = cameraKit;
+        // Need a brief getUserMedia call to trigger permission prompt, then enumerate
+        const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        tempStream.getTracks().forEach(t => t.stop());
 
-        // Load lenses from group
-        const result = await cameraKit.lensRepository.loadLensGroups([LENS_GROUP_ID]);
-        if (cancelled) return;
-        // loadLensGroups returns Lens[] or { lenses: Lens[] } depending on version
-        const loadedLenses = Array.isArray(result) ? result : (result as { lenses: Lens[] }).lenses ?? [];
-        setLenses(loadedLenses);
-        setSdkReady(true);
-      } catch (err) {
-        if (!cancelled) {
-          setError(`Failed to initialize Snap Camera Kit: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices
+          .filter(d => d.kind === 'videoinput')
+          .map(d => ({ deviceId: d.deviceId, label: d.label || `Camera ${d.deviceId.slice(0, 8)}` }));
+
+        setCameras(videoDevices);
+
+        // Auto-detect Snapchat Camera
+        const snapCam = videoDevices.find(d =>
+          d.label.toLowerCase().includes('snap') || d.label.toLowerCase().includes('snapchat')
+        );
+        if (snapCam) {
+          setSelectedCamera(snapCam.deviceId);
+          setHasSnapCamera(true);
+        } else if (videoDevices.length > 0) {
+          setSelectedCamera(videoDevices[0].deviceId);
         }
+      } catch {
+        setError('Camera access denied. Please allow camera permissions and reload.');
       }
     })();
-
-    return () => { cancelled = true; };
   }, []);
 
   const startCamera = useCallback(async () => {
-    if (!cameraKitRef.current || !canvasRef.current) return;
+    if (!selectedCamera) { setError('No camera selected.'); return; }
 
     setLoading(true);
     setError(null);
 
     try {
-      const cameraKit = cameraKitRef.current;
+      // Stop existing stream if any
+      streamRef.current?.getTracks().forEach(t => t.stop());
 
-      // Create session
-      const session = await cameraKit.createSession({
-        liveRenderTarget: canvasRef.current,
-      });
-      sessionRef.current = session;
-
-      // Set canvas size
-      canvasRef.current.width = 640;
-      canvasRef.current.height = 480;
-
-      // Get webcam stream
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480, facingMode: 'user' },
+        video: { deviceId: { exact: selectedCamera }, width: 640, height: 480 },
       });
       streamRef.current = stream;
 
-      // Connect webcam to Camera Kit — mirror the front camera
-      const source = createMediaStreamSource(stream, {
-        transform: Transform2D.MirrorX,
-        cameraType: 'user',
-      });
-      await session.setSource(source);
-
-      // Apply first lens if available
-      if (lenses.length > 0) {
-        await session.applyLens(lenses[0]);
-        setActiveLensIdx(0);
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await new Promise<void>((resolve) => {
+          video.onloadedmetadata = () => resolve();
+          if (video.readyState >= 1) resolve();
+        });
+        await video.play();
       }
-
-      // Start rendering
-      await session.play();
-
       setCameraOn(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start camera.');
+    } catch {
+      setError('Failed to start camera. Make sure the selected camera is available.');
     } finally {
       setLoading(false);
     }
-  }, [lenses]);
+  }, [selectedCamera]);
 
   const stopCamera = useCallback(() => {
-    sessionRef.current?.pause();
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
-    sessionRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
     setCameraOn(false);
   }, []);
 
-  const switchLens = useCallback(async (idx: number) => {
-    if (!sessionRef.current || !lenses[idx]) return;
-    try {
-      await sessionRef.current.applyLens(lenses[idx]);
-      setActiveLensIdx(idx);
-    } catch {
-      setError('Failed to switch lens.');
+  const switchCamera = useCallback(async (deviceId: string) => {
+    setSelectedCamera(deviceId);
+    if (cameraOn) {
+      // Restart with new camera
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: { exact: deviceId }, width: 640, height: 480 },
+        });
+        streamRef.current = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+        }
+      } catch {
+        setError('Failed to switch camera.');
+      }
     }
-  }, [lenses]);
-
-  const removeLens = useCallback(async () => {
-    if (!sessionRef.current) return;
-    await sessionRef.current.removeLens();
-    setActiveLensIdx(-1);
-  }, []);
+  }, [cameraOn]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      sessionRef.current?.pause();
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
   const handleCapture = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(video, 0, 0);
 
     canvas.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `webcam-aged-${Date.now()}.png`;
+      a.download = `webcam-capture-${Date.now()}.png`;
       a.click();
       URL.revokeObjectURL(url);
     });
   };
-
-  if (noToken) {
-    return (
-      <div className="bg-amber-50 border border-amber-200 rounded-2xl p-8 text-center space-y-3">
-        <AlertCircle className="w-8 h-8 mx-auto text-amber-500" />
-        <h3 className="text-lg font-semibold text-slate-800">Snap Camera Kit not configured</h3>
-        <p className="text-sm text-slate-600 max-w-lg mx-auto">
-          The live webcam aging feature requires a Snap Camera Kit API token. Add your tokens to the
-          environment variables <code className="px-1.5 py-0.5 bg-amber-100 rounded text-xs">VITE_SNAP_STAGING_TOKEN</code> and <code className="px-1.5 py-0.5 bg-amber-100 rounded text-xs">VITE_SNAP_PRODUCTION_TOKEN</code> to enable this feature.
-        </p>
-      </div>
-    );
-  }
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         {/* Left: Controls */}
         <div className="space-y-6">
+          {/* Camera selector */}
           <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5">
             <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
-              <SlidersHorizontal className="w-4 h-4" />
-              AR Lens Controls
+              <MonitorSmartphone className="w-4 h-4" />
+              Camera Source
             </div>
 
-            {/* Lens selector */}
-            {lenses.length > 0 && cameraOn && (
-              <div>
-                <div className="flex items-center gap-2 text-sm text-slate-600 mb-2">
-                  <span>Active lens</span>
-                  <Tooltip text="Select which AR aging lens to apply. Each lens provides a different aging style and intensity." />
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {lenses.map((lens, idx) => (
-                    <button
-                      key={lens.id}
-                      onClick={() => switchLens(idx)}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
-                        activeLensIdx === idx
-                          ? 'bg-amber-100 border-amber-300 text-amber-800'
-                          : 'bg-white border-slate-200 text-slate-600 hover:border-amber-300'
-                      }`}
-                    >
-                      {lens.name || `Lens ${idx + 1}`}
-                    </button>
-                  ))}
-                  <button
-                    onClick={removeLens}
-                    className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
-                      activeLensIdx === -1
-                        ? 'bg-slate-100 border-slate-300 text-slate-800'
-                        : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'
-                    }`}
-                  >
-                    No filter
-                  </button>
-                </div>
+            <div>
+              <div className="flex items-center gap-2 text-sm text-slate-600 mb-2">
+                <span>Select camera</span>
+                <Tooltip text="Choose your camera source. If you have the Snapchat Camera for Chrome extension installed with an aging lens active, select 'Snapchat Camera' for real-time face aging." />
+              </div>
+              <select
+                value={selectedCamera}
+                onChange={(e) => switchCamera(e.target.value)}
+                className="w-full px-3 py-2.5 text-sm border border-slate-300 rounded-lg bg-white focus:ring-2 focus:ring-amber-400 outline-none"
+              >
+                {cameras.map((cam) => (
+                  <option key={cam.deviceId} value={cam.deviceId}>
+                    {cam.label}
+                    {cam.label.toLowerCase().includes('snap') ? ' (Aging filter)' : ''}
+                  </option>
+                ))}
+                {cameras.length === 0 && <option value="">No cameras found</option>}
+              </select>
+            </div>
+
+            {hasSnapCamera && (
+              <div className="flex items-center gap-2 px-3 py-2 bg-green-50 border border-green-200 rounded-lg">
+                <div className="w-2 h-2 bg-green-500 rounded-full flex-shrink-0" />
+                <p className="text-xs text-green-700">Snapchat Camera detected — aging filter will be applied in real-time.</p>
               </div>
             )}
 
-            {lenses.length === 0 && sdkReady && (
-              <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
-                <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0" />
-                <p className="text-xs text-amber-700">
-                  No lenses found in your lens group. Add an aging lens in the <a href="https://my-lenses.snapchat.com" target="_blank" rel="noopener noreferrer" className="underline">Snap Lens Scheduler</a> to enable AR effects.
-                </p>
+            {!hasSnapCamera && cameras.length > 0 && (
+              <div className="px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
+                <p className="text-xs text-amber-700 mb-1 font-medium">For real-time face aging:</p>
+                <ol className="text-xs text-amber-600 space-y-0.5 list-decimal list-inside">
+                  <li>Install the <a href="https://chromewebstore.google.com/detail/snapchat-camera-for-chrom/mgijmfgdpljgnhcmokgeokdibogckgoj" target="_blank" rel="noopener noreferrer" className="underline font-medium">Snapchat Camera for Chrome</a> extension</li>
+                  <li>Open the extension and select an aging lens</li>
+                  <li>Reload this page — "Snapchat Camera" will appear in the dropdown above</li>
+                </ol>
               </div>
             )}
 
             <div className="p-3 bg-slate-50 rounded-lg">
               <p className="text-xs text-slate-500 leading-relaxed">
-                AR effects run entirely in your browser via Snap Camera Kit. No camera images are sent to any server. Face processing happens locally on this device.
+                All video processing happens locally on this device through the Snapchat Camera extension. No camera images are sent to any server by this website.
               </p>
             </div>
           </div>
@@ -250,13 +211,11 @@ export default function WebcamAging() {
             {!cameraOn ? (
               <button
                 onClick={startCamera}
-                disabled={loading || !sdkReady}
+                disabled={loading || cameras.length === 0}
                 className="flex-1 flex items-center justify-center gap-2 px-6 py-3 text-sm font-medium text-white bg-gradient-to-r from-amber-500 to-orange-500 rounded-xl hover:from-amber-400 hover:to-orange-400 disabled:opacity-50 disabled:cursor-not-allowed shadow-md transition-all"
               >
                 {loading ? (
                   <><Loader2 className="w-4 h-4 animate-spin" /> Starting camera...</>
-                ) : !sdkReady ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Loading AR engine...</>
                 ) : (
                   <><Camera className="w-4 h-4" /> Start Camera</>
                 )}
@@ -278,31 +237,31 @@ export default function WebcamAging() {
               </>
             )}
           </div>
-
-          {!sdkReady && !error && !noToken && (
-            <div className="flex items-center gap-2 text-xs text-slate-400">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              Initializing Snap Camera Kit...
-            </div>
-          )}
         </div>
 
         {/* Right: Video feed */}
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
-            <canvas
-              ref={canvasRef}
+            <video
+              ref={videoRef}
+              playsInline
+              muted
               style={{
                 maxWidth: '100%',
                 borderRadius: '0.5rem',
                 display: cameraOn ? 'block' : 'none',
+                transform: 'scaleX(-1)',
               }}
             />
             {!cameraOn && (
               <div className="text-center space-y-3">
                 <Camera className="w-10 h-10 mx-auto text-slate-200" />
-                <p className="text-sm text-slate-400">Click "Start Camera" to begin live AR aging</p>
-                <p className="text-xs text-slate-300">Requires camera permission. All processing happens locally — no images leave your device.</p>
+                <p className="text-sm text-slate-400">Click "Start Camera" to begin</p>
+                <p className="text-xs text-slate-300">
+                  {hasSnapCamera
+                    ? 'Snapchat Camera detected — your aging filter is ready.'
+                    : 'Use the Snapchat Camera extension for real-time face aging effects.'}
+                </p>
               </div>
             )}
           </div>
