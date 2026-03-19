@@ -21,19 +21,18 @@ interface FaceState {
   x: number;
   y: number;
   s: number;
-  rx: number;
-  ry: number;
   rz: number;
-  expressions: number[];
 }
 
 export default function WebcamAging() {
-  const faceCanvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const animRef = useRef<number>(0);
+  const cameraOnRef = useRef(false);
   const faceFilterRef = useRef<any>(null);
-  const faceStateRef = useRef<FaceState>({
-    detected: false, x: 0, y: 0, s: 0, rx: 0, ry: 0, rz: 0, expressions: [],
-  });
+  const hiddenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const faceStateRef = useRef<FaceState>({ detected: false, x: 0, y: 0, s: 0, rz: 0 });
 
   const [cameraOn, setCameraOn] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -49,165 +48,44 @@ export default function WebcamAging() {
   useEffect(() => { showWrinklesRef.current = showWrinkles; }, [showWrinkles]);
   useEffect(() => { showSkinAgingRef.current = showSkinAging; }, [showSkinAging]);
 
-  const drawAgingOverlay = useCallback(() => {
-    const overlay = overlayCanvasRef.current;
-    const faceCanvas = faceCanvasRef.current;
-    if (!overlay || !faceCanvas) return;
-
-    const ctx = overlay.getContext('2d');
-    if (!ctx) return;
-
-    const W = faceCanvas.width;
-    const H = faceCanvas.height;
-    overlay.width = W;
-    overlay.height = H;
-    ctx.clearRect(0, 0, W, H);
-
-    const face = faceStateRef.current;
-    if (!face.detected) return;
-
-    const factor = ageIntensityRef.current / 100;
-    if (factor === 0) return;
-
-    // Convert facefilter coordinates (-1..1) to canvas pixels
-    const cx = (face.x + 1) * 0.5 * W;
-    const cy = (1 - (face.y + 1) * 0.5) * H;
-    const faceSize = face.s * W * 0.6;
-
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(-face.rz);
-
-    // Skin aging: semi-transparent warm overlay on face region
-    if (showSkinAgingRef.current) {
-      const grad = ctx.createRadialGradient(0, 0, faceSize * 0.1, 0, 0, faceSize);
-      grad.addColorStop(0, `rgba(120, 80, 50, ${factor * 0.15})`);
-      grad.addColorStop(0.7, `rgba(100, 70, 45, ${factor * 0.1})`);
-      grad.addColorStop(1, 'rgba(100, 70, 45, 0)');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.ellipse(0, faceSize * 0.05, faceSize, faceSize * 1.3, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    if (showWrinklesRef.current) {
-      const alpha = Math.min(factor * 0.8, 0.7);
-      const lw = 1 + factor * 1.5;
-
-      // Forehead wrinkles
-      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha})`;
-      ctx.lineWidth = lw;
-      ctx.lineCap = 'round';
-
-      for (let i = 0; i < 4; i++) {
-        const y = -faceSize * (0.6 + i * 0.08);
-        const spread = faceSize * (0.35 - i * 0.03);
-        ctx.beginPath();
-        ctx.moveTo(-spread, y);
-        ctx.quadraticCurveTo(0, y - 3 + Math.sin(i * 1.5) * 2, spread, y);
-        ctx.stroke();
-      }
-
-      // Crow's feet (both sides)
-      ctx.lineWidth = lw * 0.8;
-      for (const side of [-1, 1]) {
-        const ex = side * faceSize * 0.42;
-        const ey = -faceSize * 0.15;
-        for (let j = -2; j <= 2; j++) {
-          ctx.beginPath();
-          ctx.moveTo(ex, ey);
-          ctx.lineTo(
-            ex + side * faceSize * (0.08 + factor * 0.06),
-            ey + j * faceSize * 0.04
-          );
-          ctx.stroke();
-        }
-      }
-
-      // Nasolabial folds
-      ctx.lineWidth = lw * 1.2;
-      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.8})`;
-      for (const side of [-1, 1]) {
-        const nx = side * faceSize * 0.18;
-        ctx.beginPath();
-        ctx.moveTo(nx, -faceSize * 0.05);
-        ctx.quadraticCurveTo(
-          nx + side * faceSize * 0.06,
-          faceSize * 0.15,
-          nx - side * faceSize * 0.02,
-          faceSize * 0.35
-        );
-        ctx.stroke();
-      }
-
-      // Under-eye bags
-      ctx.lineWidth = lw * 0.7;
-      ctx.strokeStyle = `rgba(90, 55, 35, ${alpha * 0.5})`;
-      for (const side of [-1, 1]) {
-        const ux = side * faceSize * 0.2;
-        const uy = -faceSize * 0.08;
-        ctx.beginPath();
-        ctx.moveTo(ux - faceSize * 0.1, uy);
-        ctx.quadraticCurveTo(ux, uy + faceSize * 0.04, ux + faceSize * 0.1, uy);
-        ctx.stroke();
-      }
-
-      // Lip lines
-      ctx.lineWidth = lw * 0.5;
-      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.4})`;
-      for (let i = -3; i <= 3; i++) {
-        const lx = i * faceSize * 0.04;
-        ctx.beginPath();
-        ctx.moveTo(lx, faceSize * 0.25);
-        ctx.lineTo(lx + (i > 0 ? 1.5 : -1.5), faceSize * 0.32);
-        ctx.stroke();
-      }
-
-      // Age spots
-      ctx.fillStyle = `rgba(100, 65, 35, ${alpha * 0.25})`;
-      const spots = [
-        [-0.25, -0.5, 3], [0.2, -0.55, 2.5], [-0.15, -0.3, 2],
-        [0.3, -0.4, 3.5], [-0.3, 0.1, 2], [0.25, 0.05, 2.5],
-        [0.35, -0.2, 2], [-0.35, -0.45, 3],
-      ];
-      for (const [rx, ry, r] of spots) {
-        ctx.beginPath();
-        ctx.arc(rx * faceSize, ry * faceSize, r * (0.5 + factor * 0.5), 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // Forehead creases (vertical between brows)
-      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.6})`;
-      ctx.lineWidth = lw;
-      for (const side of [-1, 1]) {
-        ctx.beginPath();
-        ctx.moveTo(side * faceSize * 0.06, -faceSize * 0.45);
-        ctx.lineTo(side * faceSize * 0.05, -faceSize * 0.55);
-        ctx.stroke();
-      }
-    }
-
-    ctx.restore();
-  }, []);
-
   const startCamera = useCallback(async () => {
     setLoading(true);
     setError(null);
 
     try {
+      // Get webcam
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' },
+      });
+      streamRef.current = stream;
+
+      const video = videoRef.current!;
+      video.srcObject = stream;
+      await new Promise<void>((resolve) => {
+        video.onloadedmetadata = () => resolve();
+        if (video.readyState >= 1) resolve();
+      });
+      await video.play();
+
+      // Create a hidden canvas for facefilter (it needs its own WebGL canvas)
+      const hiddenCanvas = document.createElement('canvas');
+      hiddenCanvas.width = 320;
+      hiddenCanvas.height = 240;
+      hiddenCanvasRef.current = hiddenCanvas;
+
+      // Init facefilter on the hidden canvas
       const { JEELIZFACEFILTER, NN_4EXPR } = await import('facefilter');
-
-      const canvas = faceCanvasRef.current;
-      if (!canvas) throw new Error('Canvas not ready');
-
       faceFilterRef.current = JEELIZFACEFILTER;
 
       await new Promise<void>((resolve, reject) => {
         JEELIZFACEFILTER.init({
-          canvas,
+          canvas: hiddenCanvas,
           NNC: NN_4EXPR,
           maxFacesDetected: 1,
           followZRot: true,
+          videoSettings: {
+            videoElement: video,
+          },
 
           callbackReady: (errCode: any) => {
             if (errCode) {
@@ -223,54 +101,123 @@ export default function WebcamAging() {
               x: state.x,
               y: state.y,
               s: state.s,
-              rx: state.rx,
-              ry: state.ry,
               rz: state.rz,
-              expressions: state.expressions ? [...state.expressions] : [],
             };
-
-            // Draw aging overlay on the second canvas
-            drawAgingOverlay();
           },
         });
       });
 
+      cameraOnRef.current = true;
       setCameraOn(true);
+
+      // Start render loop: draw video + aging overlay on visible canvas
+      const renderLoop = () => {
+        if (!cameraOnRef.current) return;
+
+        const canvas = canvasRef.current;
+        const vid = videoRef.current;
+        if (!canvas || !vid || vid.readyState < 2) {
+          animRef.current = requestAnimationFrame(renderLoop);
+          return;
+        }
+
+        const W = vid.videoWidth;
+        const H = vid.videoHeight;
+        canvas.width = W;
+        canvas.height = H;
+
+        const ctx = canvas.getContext('2d')!;
+
+        // Draw mirrored video
+        ctx.save();
+        ctx.translate(W, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(vid, 0, 0, W, H);
+        ctx.restore();
+
+        // Apply skin aging to the video pixels in the face region
+        const face = faceStateRef.current;
+        if (face.detected) {
+          const factor = ageIntensityRef.current / 100;
+
+          // Convert facefilter coords to canvas pixels (mirrored)
+          const cx = (1 - (face.x + 1) * 0.5) * W; // mirrored
+          const cy = (1 - (face.y + 1) * 0.5) * H;
+          const faceSize = face.s * W * 0.55;
+
+          // Skin desaturation in face region
+          if (showSkinAgingRef.current && factor > 0) {
+            const r = faceSize * 1.2;
+            const sx = Math.max(0, Math.floor(cx - r));
+            const sy = Math.max(0, Math.floor(cy - r));
+            const sw = Math.min(W - sx, Math.ceil(r * 2));
+            const sh = Math.min(H - sy, Math.ceil(r * 2));
+
+            if (sw > 0 && sh > 0) {
+              const imageData = ctx.getImageData(sx, sy, sw, sh);
+              const d = imageData.data;
+              const blend = factor * 0.25;
+              const rcx = cx - sx;
+              const rcy = cy - sy;
+
+              for (let py = 0; py < sh; py++) {
+                for (let px = 0; px < sw; px++) {
+                  const dist = Math.sqrt((px - rcx) ** 2 + (py - rcy) ** 2);
+                  if (dist > r) continue;
+                  const falloff = 1 - (dist / r);
+                  const b = blend * falloff;
+                  const i = (py * sw + px) * 4;
+                  const grey = d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
+                  d[i] = d[i] * (1 - b) + (grey + 10) * b;
+                  d[i + 1] = d[i + 1] * (1 - b) + (grey - 2) * b;
+                  d[i + 2] = d[i + 2] * (1 - b) + (grey - 8) * b;
+                }
+              }
+              ctx.putImageData(imageData, sx, sy);
+            }
+          }
+
+          // Draw wrinkle overlay
+          if (showWrinklesRef.current && factor > 0) {
+            drawWrinkles(ctx, cx, cy, faceSize, face.rz, factor);
+          }
+        }
+
+        animRef.current = requestAnimationFrame(renderLoop);
+      };
+
+      animRef.current = requestAnimationFrame(renderLoop);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start camera.');
     } finally {
       setLoading(false);
     }
-  }, [drawAgingOverlay]);
+  }, []);
 
   const stopCamera = useCallback(() => {
-    try {
-      faceFilterRef.current?.destroy();
-    } catch {}
+    cameraOnRef.current = false;
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    try { faceFilterRef.current?.destroy(); } catch {}
     faceFilterRef.current = null;
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
     setCameraOn(false);
   }, []);
 
   useEffect(() => {
     return () => {
+      cameraOnRef.current = false;
+      if (animRef.current) cancelAnimationFrame(animRef.current);
       try { faceFilterRef.current?.destroy(); } catch {}
+      streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
 
   const handleCapture = () => {
-    const faceCanvas = faceCanvasRef.current;
-    const overlay = overlayCanvasRef.current;
-    if (!faceCanvas) return;
-
-    // Composite both canvases
-    const out = document.createElement('canvas');
-    out.width = faceCanvas.width;
-    out.height = faceCanvas.height;
-    const ctx = out.getContext('2d')!;
-    ctx.drawImage(faceCanvas, 0, 0);
-    if (overlay) ctx.drawImage(overlay, 0, 0);
-
-    out.toBlob((blob) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -316,13 +263,13 @@ export default function WebcamAging() {
                 <input type="checkbox" checked={showWrinkles} onChange={(e) => setShowWrinkles(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Wrinkles, lines & age spots</span>
-                <Tooltip text="Overlays wrinkle patterns on the forehead, around the eyes, nasolabial folds, lip lines, age spots, and frown lines — all tracked to the face in real-time." />
+                <Tooltip text="Draws wrinkle lines, crow's feet, nasolabial folds, under-eye bags, lip lines, frown lines, and age spots — tracked to the face in real-time." />
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showSkinAging} onChange={(e) => setShowSkinAging(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Skin tone aging</span>
-                <Tooltip text="Applies a warm, slightly desaturated overlay to the face region to simulate aged skin tone." />
+                <Tooltip text="Desaturates and warms the skin tone within the face region using per-pixel processing with radial falloff." />
               </label>
             </div>
 
@@ -333,7 +280,6 @@ export default function WebcamAging() {
             </div>
           </div>
 
-          {/* Camera buttons */}
           <div className="flex gap-3">
             {!cameraOn ? (
               <button
@@ -369,26 +315,22 @@ export default function WebcamAging() {
         {/* Right: Video feed */}
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
-            <div className="relative" style={{ display: cameraOn ? 'block' : 'none' }}>
-              <canvas
-                ref={faceCanvasRef}
-                width={640}
-                height={480}
-                style={{ maxWidth: '100%', borderRadius: '0.5rem' }}
-              />
-              <canvas
-                ref={overlayCanvasRef}
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  width: '100%',
-                  height: '100%',
-                  borderRadius: '0.5rem',
-                  pointerEvents: 'none',
-                }}
-              />
-            </div>
+            {/* Hidden video element for webcam stream */}
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              style={{ position: 'absolute', width: 0, height: 0, opacity: 0 }}
+            />
+            {/* Visible canvas with video + aging overlay composited */}
+            <canvas
+              ref={canvasRef}
+              style={{
+                maxWidth: '100%',
+                borderRadius: '0.5rem',
+                display: cameraOn ? 'block' : 'none',
+              }}
+            />
             {!cameraOn && (
               <div className="text-center space-y-3">
                 <Camera className="w-10 h-10 mx-auto text-slate-200" />
@@ -408,4 +350,105 @@ export default function WebcamAging() {
       )}
     </div>
   );
+}
+
+// ── Wrinkle drawing ─────────────────────────────────────────────────────────
+
+function drawWrinkles(
+  ctx: CanvasRenderingContext2D,
+  cx: number, cy: number,
+  faceSize: number, rz: number,
+  factor: number
+) {
+  const alpha = Math.min(factor * 0.8, 0.7);
+  const lw = 1 + factor * 1.5;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-rz);
+  ctx.lineCap = 'round';
+
+  // Forehead wrinkles
+  ctx.strokeStyle = `rgba(70, 40, 25, ${alpha})`;
+  ctx.lineWidth = lw;
+  for (let i = 0; i < 4; i++) {
+    const y = -faceSize * (0.55 + i * 0.08);
+    const spread = faceSize * (0.32 - i * 0.02);
+    ctx.beginPath();
+    ctx.moveTo(-spread, y);
+    ctx.quadraticCurveTo(0, y - 2 + Math.sin(i * 1.5) * 2, spread, y);
+    ctx.stroke();
+  }
+
+  // Crow's feet
+  ctx.lineWidth = lw * 0.8;
+  for (const side of [-1, 1]) {
+    const ex = side * faceSize * 0.4;
+    const ey = -faceSize * 0.12;
+    for (let j = -2; j <= 2; j++) {
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex + side * faceSize * (0.07 + factor * 0.05), ey + j * faceSize * 0.035);
+      ctx.stroke();
+    }
+  }
+
+  // Nasolabial folds
+  ctx.lineWidth = lw * 1.2;
+  ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.8})`;
+  for (const side of [-1, 1]) {
+    const nx = side * faceSize * 0.16;
+    ctx.beginPath();
+    ctx.moveTo(nx, -faceSize * 0.02);
+    ctx.quadraticCurveTo(nx + side * faceSize * 0.05, faceSize * 0.15, nx - side * faceSize * 0.02, faceSize * 0.32);
+    ctx.stroke();
+  }
+
+  // Under-eye bags
+  ctx.lineWidth = lw * 0.7;
+  ctx.strokeStyle = `rgba(90, 55, 35, ${alpha * 0.5})`;
+  for (const side of [-1, 1]) {
+    const ux = side * faceSize * 0.18;
+    const uy = -faceSize * 0.06;
+    ctx.beginPath();
+    ctx.moveTo(ux - faceSize * 0.09, uy);
+    ctx.quadraticCurveTo(ux, uy + faceSize * 0.035, ux + faceSize * 0.09, uy);
+    ctx.stroke();
+  }
+
+  // Lip lines
+  ctx.lineWidth = lw * 0.5;
+  ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.4})`;
+  for (let i = -3; i <= 3; i++) {
+    const lx = i * faceSize * 0.035;
+    ctx.beginPath();
+    ctx.moveTo(lx, faceSize * 0.22);
+    ctx.lineTo(lx + (i > 0 ? 1.5 : -1.5), faceSize * 0.28);
+    ctx.stroke();
+  }
+
+  // Frown lines between brows
+  ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.6})`;
+  ctx.lineWidth = lw;
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(side * faceSize * 0.055, -faceSize * 0.38);
+    ctx.lineTo(side * faceSize * 0.045, -faceSize * 0.48);
+    ctx.stroke();
+  }
+
+  // Age spots
+  ctx.fillStyle = `rgba(100, 65, 35, ${alpha * 0.2})`;
+  const spots = [
+    [-0.22, -0.45, 3], [0.18, -0.5, 2.5], [-0.12, -0.25, 2],
+    [0.28, -0.35, 3.5], [-0.28, 0.08, 2], [0.22, 0.03, 2.5],
+    [0.32, -0.18, 2], [-0.32, -0.4, 3],
+  ];
+  for (const [rx, ry, r] of spots) {
+    ctx.beginPath();
+    ctx.arc(rx * faceSize, ry * faceSize, r * (0.5 + factor * 0.5), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
 }
