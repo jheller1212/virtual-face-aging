@@ -16,12 +16,11 @@ function Tooltip({ text }: { text: string }) {
   );
 }
 
-interface FaceState {
-  detected: boolean;
+interface FaceRect {
   x: number;
   y: number;
-  s: number;
-  rz: number;
+  width: number;
+  height: number;
 }
 
 export default function WebcamAging() {
@@ -30,13 +29,14 @@ export default function WebcamAging() {
   const streamRef = useRef<MediaStream | null>(null);
   const animRef = useRef<number>(0);
   const cameraOnRef = useRef(false);
-  const faceFilterRef = useRef<any>(null);
-  const hiddenCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const faceStateRef = useRef<FaceState>({ detected: false, x: 0, y: 0, s: 0, rz: 0 });
+  const faceDetectorRef = useRef<any>(null);
+  const lastFaceRef = useRef<FaceRect | null>(null);
+  const detectIntervalRef = useRef<number>(0);
 
   const [cameraOn, setCameraOn] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [faceDetected, setFaceDetected] = useState(false);
   const [ageIntensity, setAgeIntensity] = useState(60);
   const [showWrinkles, setShowWrinkles] = useState(true);
   const [showSkinAging, setShowSkinAging] = useState(true);
@@ -53,7 +53,6 @@ export default function WebcamAging() {
     setError(null);
 
     try {
-      // Get webcam
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: 'user' },
       });
@@ -67,50 +66,53 @@ export default function WebcamAging() {
       });
       await video.play();
 
-      // Create a hidden canvas for facefilter (it needs its own WebGL canvas)
-      const hiddenCanvas = document.createElement('canvas');
-      hiddenCanvas.width = 320;
-      hiddenCanvas.height = 240;
-      hiddenCanvasRef.current = hiddenCanvas;
-
-      // Init facefilter on the hidden canvas
-      const { JEELIZFACEFILTER, NN_4EXPR } = await import('facefilter');
-      faceFilterRef.current = JEELIZFACEFILTER;
-
-      await new Promise<void>((resolve, reject) => {
-        JEELIZFACEFILTER.init({
-          canvas: hiddenCanvas,
-          NNC: NN_4EXPR,
-          maxFacesDetected: 1,
-          followZRot: true,
-          videoSettings: {
-            videoElement: video,
-          },
-
-          callbackReady: (errCode: any) => {
-            if (errCode) {
-              reject(new Error(`FaceFilter error: ${errCode}`));
-              return;
-            }
-            resolve();
-          },
-
-          callbackTrack: (state: any) => {
-            faceStateRef.current = {
-              detected: state.detected > 0.5,
-              x: state.x,
-              y: state.y,
-              s: state.s,
-              rz: state.rz,
-            };
-          },
-        });
-      });
+      // Try to use Chrome's built-in FaceDetector API
+      if ('FaceDetector' in window) {
+        try {
+          faceDetectorRef.current = new (window as any).FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+        } catch {
+          // FaceDetector not available
+        }
+      }
 
       cameraOnRef.current = true;
       setCameraOn(true);
 
-      // Start render loop: draw video + aging overlay on visible canvas
+      // Face detection loop (runs every 100ms, separate from render)
+      const detectFace = async () => {
+        if (!cameraOnRef.current) return;
+        const vid = videoRef.current;
+        if (vid && vid.readyState >= 2 && faceDetectorRef.current) {
+          try {
+            const faces = await faceDetectorRef.current.detect(vid);
+            if (faces.length > 0) {
+              const box = faces[0].boundingBox;
+              lastFaceRef.current = { x: box.x, y: box.y, width: box.width, height: box.height };
+              setFaceDetected(true);
+            } else {
+              // Keep last known face position for a bit
+              setFaceDetected(false);
+            }
+          } catch {
+            // Detection failed this frame
+          }
+        } else if (!faceDetectorRef.current && vid && vid.readyState >= 2) {
+          // Fallback: assume face is roughly centered
+          const W = vid.videoWidth;
+          const H = vid.videoHeight;
+          lastFaceRef.current = {
+            x: W * 0.25,
+            y: H * 0.1,
+            width: W * 0.5,
+            height: H * 0.7,
+          };
+          setFaceDetected(true);
+        }
+        detectIntervalRef.current = window.setTimeout(detectFace, 100);
+      };
+      detectFace();
+
+      // Render loop
       const renderLoop = () => {
         if (!cameraOnRef.current) return;
 
@@ -125,7 +127,6 @@ export default function WebcamAging() {
         const H = vid.videoHeight;
         canvas.width = W;
         canvas.height = H;
-
         const ctx = canvas.getContext('2d')!;
 
         // Draw mirrored video
@@ -135,51 +136,50 @@ export default function WebcamAging() {
         ctx.drawImage(vid, 0, 0, W, H);
         ctx.restore();
 
-        // Apply skin aging to the video pixels in the face region
-        const face = faceStateRef.current;
-        if (face.detected) {
-          const factor = ageIntensityRef.current / 100;
+        const face = lastFaceRef.current;
+        const factor = ageIntensityRef.current / 100;
 
-          // Convert facefilter coords to canvas pixels (mirrored)
-          const cx = (1 - (face.x + 1) * 0.5) * W; // mirrored
-          const cy = (1 - (face.y + 1) * 0.5) * H;
-          const faceSize = face.s * W * 0.55;
+        if (face && factor > 0) {
+          // Mirror the face x coordinate
+          const fcx = W - (face.x + face.width / 2);
+          const fcy = face.y + face.height / 2;
+          const faceSize = face.width * 0.55;
 
-          // Skin desaturation in face region
-          if (showSkinAgingRef.current && factor > 0) {
-            const r = faceSize * 1.2;
-            const sx = Math.max(0, Math.floor(cx - r));
-            const sy = Math.max(0, Math.floor(cy - r));
+          // Skin aging
+          if (showSkinAgingRef.current) {
+            const r = faceSize * 1.3;
+            const sx = Math.max(0, Math.floor(fcx - r));
+            const sy = Math.max(0, Math.floor(fcy - r));
             const sw = Math.min(W - sx, Math.ceil(r * 2));
             const sh = Math.min(H - sy, Math.ceil(r * 2));
 
             if (sw > 0 && sh > 0) {
               const imageData = ctx.getImageData(sx, sy, sw, sh);
               const d = imageData.data;
-              const blend = factor * 0.25;
-              const rcx = cx - sx;
-              const rcy = cy - sy;
+              const blend = factor * 0.22;
+              const rcx = fcx - sx;
+              const rcy = fcy - sy;
 
               for (let py = 0; py < sh; py++) {
                 for (let px = 0; px < sw; px++) {
                   const dist = Math.sqrt((px - rcx) ** 2 + (py - rcy) ** 2);
                   if (dist > r) continue;
                   const falloff = 1 - (dist / r);
-                  const b = blend * falloff;
+                  const b = blend * falloff * falloff; // quadratic falloff for smoother edge
                   const i = (py * sw + px) * 4;
                   const grey = d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
-                  d[i] = d[i] * (1 - b) + (grey + 10) * b;
+                  d[i] = d[i] * (1 - b) + (grey + 8) * b;
                   d[i + 1] = d[i + 1] * (1 - b) + (grey - 2) * b;
-                  d[i + 2] = d[i + 2] * (1 - b) + (grey - 8) * b;
+                  d[i + 2] = d[i + 2] * (1 - b) + (grey - 6) * b;
                 }
               }
               ctx.putImageData(imageData, sx, sy);
             }
           }
 
-          // Draw wrinkle overlay
-          if (showWrinklesRef.current && factor > 0) {
-            drawWrinkles(ctx, cx, cy, faceSize, face.rz, factor);
+          // Wrinkles
+          if (showWrinklesRef.current) {
+            drawWrinkles(ctx, fcx, fcy, faceSize, factor);
           }
         }
 
@@ -197,19 +197,21 @@ export default function WebcamAging() {
   const stopCamera = useCallback(() => {
     cameraOnRef.current = false;
     if (animRef.current) cancelAnimationFrame(animRef.current);
-    try { faceFilterRef.current?.destroy(); } catch {}
-    faceFilterRef.current = null;
+    if (detectIntervalRef.current) clearTimeout(detectIntervalRef.current);
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
     if (videoRef.current) videoRef.current.srcObject = null;
+    lastFaceRef.current = null;
+    faceDetectorRef.current = null;
     setCameraOn(false);
+    setFaceDetected(false);
   }, []);
 
   useEffect(() => {
     return () => {
       cameraOnRef.current = false;
       if (animRef.current) cancelAnimationFrame(animRef.current);
-      try { faceFilterRef.current?.destroy(); } catch {}
+      if (detectIntervalRef.current) clearTimeout(detectIntervalRef.current);
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []);
@@ -231,7 +233,6 @@ export default function WebcamAging() {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Left: Controls */}
         <div className="space-y-6">
           <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5">
             <div className="flex items-center gap-2 text-sm font-medium text-slate-700">
@@ -263,15 +264,22 @@ export default function WebcamAging() {
                 <input type="checkbox" checked={showWrinkles} onChange={(e) => setShowWrinkles(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Wrinkles, lines & age spots</span>
-                <Tooltip text="Draws wrinkle lines, crow's feet, nasolabial folds, under-eye bags, lip lines, frown lines, and age spots — tracked to the face in real-time." />
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showSkinAging} onChange={(e) => setShowSkinAging(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Skin tone aging</span>
-                <Tooltip text="Desaturates and warms the skin tone within the face region using per-pixel processing with radial falloff." />
               </label>
             </div>
+
+            {cameraOn && (
+              <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs ${
+                faceDetected ? 'bg-green-50 border border-green-200 text-green-700' : 'bg-amber-50 border border-amber-200 text-amber-700'
+              }`}>
+                <div className={`w-2 h-2 rounded-full ${faceDetected ? 'bg-green-500' : 'bg-amber-500'}`} />
+                {faceDetected ? 'Face detected — aging effects active' : 'Looking for face...'}
+              </div>
+            )}
 
             <div className="p-3 bg-slate-50 rounded-lg">
               <p className="text-xs text-slate-500 leading-relaxed">
@@ -287,24 +295,16 @@ export default function WebcamAging() {
                 disabled={loading}
                 className="flex-1 flex items-center justify-center gap-2 px-6 py-3 text-sm font-medium text-white bg-gradient-to-r from-amber-500 to-orange-500 rounded-xl hover:from-amber-400 hover:to-orange-400 disabled:opacity-50 disabled:cursor-not-allowed shadow-md transition-all"
               >
-                {loading ? (
-                  <><Loader2 className="w-4 h-4 animate-spin" /> Starting...</>
-                ) : (
-                  <><Camera className="w-4 h-4" /> Start Camera</>
-                )}
+                {loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Starting...</> : <><Camera className="w-4 h-4" /> Start Camera</>}
               </button>
             ) : (
               <>
-                <button
-                  onClick={stopCamera}
-                  className="flex-1 flex items-center justify-center gap-2 px-6 py-3 text-sm font-medium text-red-600 border border-red-300 rounded-xl hover:bg-red-50 transition-colors"
-                >
+                <button onClick={stopCamera}
+                  className="flex-1 flex items-center justify-center gap-2 px-6 py-3 text-sm font-medium text-red-600 border border-red-300 rounded-xl hover:bg-red-50 transition-colors">
                   <CameraOff className="w-4 h-4" /> Stop Camera
                 </button>
-                <button
-                  onClick={handleCapture}
-                  className="flex items-center gap-2 px-6 py-3 text-sm font-medium border border-slate-300 rounded-xl bg-white hover:bg-slate-50 transition-colors"
-                >
+                <button onClick={handleCapture}
+                  className="flex items-center gap-2 px-6 py-3 text-sm font-medium border border-slate-300 rounded-xl bg-white hover:bg-slate-50 transition-colors">
                   <Download className="w-4 h-4" /> Capture
                 </button>
               </>
@@ -312,25 +312,10 @@ export default function WebcamAging() {
           </div>
         </div>
 
-        {/* Right: Video feed */}
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
-            {/* Hidden video element for webcam stream */}
-            <video
-              ref={videoRef}
-              playsInline
-              muted
-              style={{ position: 'absolute', width: 0, height: 0, opacity: 0 }}
-            />
-            {/* Visible canvas with video + aging overlay composited */}
-            <canvas
-              ref={canvasRef}
-              style={{
-                maxWidth: '100%',
-                borderRadius: '0.5rem',
-                display: cameraOn ? 'block' : 'none',
-              }}
-            />
+            <video ref={videoRef} playsInline muted style={{ position: 'absolute', width: 0, height: 0, opacity: 0 }} />
+            <canvas ref={canvasRef} style={{ maxWidth: '100%', borderRadius: '0.5rem', display: cameraOn ? 'block' : 'none' }} />
             {!cameraOn && (
               <div className="text-center space-y-3">
                 <Camera className="w-10 h-10 mx-auto text-slate-200" />
@@ -352,28 +337,20 @@ export default function WebcamAging() {
   );
 }
 
-// ── Wrinkle drawing ─────────────────────────────────────────────────────────
-
-function drawWrinkles(
-  ctx: CanvasRenderingContext2D,
-  cx: number, cy: number,
-  faceSize: number, rz: number,
-  factor: number
-) {
+function drawWrinkles(ctx: CanvasRenderingContext2D, cx: number, cy: number, faceSize: number, factor: number) {
   const alpha = Math.min(factor * 0.8, 0.7);
   const lw = 1 + factor * 1.5;
 
   ctx.save();
   ctx.translate(cx, cy);
-  ctx.rotate(-rz);
   ctx.lineCap = 'round';
 
   // Forehead wrinkles
   ctx.strokeStyle = `rgba(70, 40, 25, ${alpha})`;
   ctx.lineWidth = lw;
   for (let i = 0; i < 4; i++) {
-    const y = -faceSize * (0.55 + i * 0.08);
-    const spread = faceSize * (0.32 - i * 0.02);
+    const y = -faceSize * (0.5 + i * 0.07);
+    const spread = faceSize * (0.3 - i * 0.02);
     ctx.beginPath();
     ctx.moveTo(-spread, y);
     ctx.quadraticCurveTo(0, y - 2 + Math.sin(i * 1.5) * 2, spread, y);
@@ -383,12 +360,12 @@ function drawWrinkles(
   // Crow's feet
   ctx.lineWidth = lw * 0.8;
   for (const side of [-1, 1]) {
-    const ex = side * faceSize * 0.4;
-    const ey = -faceSize * 0.12;
+    const ex = side * faceSize * 0.38;
+    const ey = -faceSize * 0.1;
     for (let j = -2; j <= 2; j++) {
       ctx.beginPath();
       ctx.moveTo(ex, ey);
-      ctx.lineTo(ex + side * faceSize * (0.07 + factor * 0.05), ey + j * faceSize * 0.035);
+      ctx.lineTo(ex + side * faceSize * (0.06 + factor * 0.05), ey + j * faceSize * 0.03);
       ctx.stroke();
     }
   }
@@ -397,22 +374,22 @@ function drawWrinkles(
   ctx.lineWidth = lw * 1.2;
   ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.8})`;
   for (const side of [-1, 1]) {
-    const nx = side * faceSize * 0.16;
+    const nx = side * faceSize * 0.15;
     ctx.beginPath();
-    ctx.moveTo(nx, -faceSize * 0.02);
-    ctx.quadraticCurveTo(nx + side * faceSize * 0.05, faceSize * 0.15, nx - side * faceSize * 0.02, faceSize * 0.32);
+    ctx.moveTo(nx, 0);
+    ctx.quadraticCurveTo(nx + side * faceSize * 0.05, faceSize * 0.15, nx - side * faceSize * 0.02, faceSize * 0.3);
     ctx.stroke();
   }
 
-  // Under-eye bags
+  // Under-eye
   ctx.lineWidth = lw * 0.7;
   ctx.strokeStyle = `rgba(90, 55, 35, ${alpha * 0.5})`;
   for (const side of [-1, 1]) {
-    const ux = side * faceSize * 0.18;
-    const uy = -faceSize * 0.06;
+    const ux = side * faceSize * 0.17;
+    const uy = -faceSize * 0.05;
     ctx.beginPath();
-    ctx.moveTo(ux - faceSize * 0.09, uy);
-    ctx.quadraticCurveTo(ux, uy + faceSize * 0.035, ux + faceSize * 0.09, uy);
+    ctx.moveTo(ux - faceSize * 0.08, uy);
+    ctx.quadraticCurveTo(ux, uy + faceSize * 0.03, ux + faceSize * 0.08, uy);
     ctx.stroke();
   }
 
@@ -420,29 +397,29 @@ function drawWrinkles(
   ctx.lineWidth = lw * 0.5;
   ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.4})`;
   for (let i = -3; i <= 3; i++) {
-    const lx = i * faceSize * 0.035;
+    const lx = i * faceSize * 0.03;
     ctx.beginPath();
-    ctx.moveTo(lx, faceSize * 0.22);
-    ctx.lineTo(lx + (i > 0 ? 1.5 : -1.5), faceSize * 0.28);
+    ctx.moveTo(lx, faceSize * 0.2);
+    ctx.lineTo(lx + (i > 0 ? 1.5 : -1.5), faceSize * 0.26);
     ctx.stroke();
   }
 
-  // Frown lines between brows
+  // Frown lines
   ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.6})`;
   ctx.lineWidth = lw;
   for (const side of [-1, 1]) {
     ctx.beginPath();
-    ctx.moveTo(side * faceSize * 0.055, -faceSize * 0.38);
-    ctx.lineTo(side * faceSize * 0.045, -faceSize * 0.48);
+    ctx.moveTo(side * faceSize * 0.05, -faceSize * 0.35);
+    ctx.lineTo(side * faceSize * 0.04, -faceSize * 0.45);
     ctx.stroke();
   }
 
   // Age spots
   ctx.fillStyle = `rgba(100, 65, 35, ${alpha * 0.2})`;
   const spots = [
-    [-0.22, -0.45, 3], [0.18, -0.5, 2.5], [-0.12, -0.25, 2],
-    [0.28, -0.35, 3.5], [-0.28, 0.08, 2], [0.22, 0.03, 2.5],
-    [0.32, -0.18, 2], [-0.32, -0.4, 3],
+    [-0.2, -0.4, 3], [0.16, -0.45, 2.5], [-0.1, -0.22, 2],
+    [0.25, -0.3, 3.5], [-0.25, 0.08, 2], [0.2, 0.03, 2.5],
+    [0.3, -0.15, 2], [-0.3, -0.38, 3],
   ];
   for (const [rx, ry, r] of spots) {
     ctx.beginPath();
