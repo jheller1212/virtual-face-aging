@@ -170,7 +170,7 @@ export default function WebcamAging() {
 
     try {
       // Dynamically import facefilter
-      const JEELIZFACEFILTER = (await import('facefilter')).default ?? (await import('facefilter'));
+      const { JEELIZFACEFILTER, NN_4EXPR } = await import('facefilter');
 
       // Create canvas if needed
       let canvas = canvasRef.current;
@@ -227,8 +227,7 @@ export default function WebcamAging() {
       await new Promise<void>((resolve, reject) => {
         JEELIZFACEFILTER.init({
           canvas,
-          NNCPath: 'https://cdn.jsdelivr.net/npm/facefilter@3.4.3/',
-          NNC: 'NN_4EXPR_1.json',
+          NNC: NN_4EXPR,
           maxFacesDetected: 1,
           followZRot: true,
 
