@@ -1,5 +1,4 @@
 import { useRef, useState, useEffect, useCallback } from 'react';
-import * as THREE from 'three';
 import {
   Camera, CameraOff, Loader2, Download, SlidersHorizontal,
   HelpCircle, AlertCircle,
@@ -17,138 +16,24 @@ function Tooltip({ text }: { text: string }) {
   );
 }
 
-// Generate a wrinkle overlay texture procedurally
-function createWrinkleTexture(size: number): THREE.Texture {
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d')!;
-
-  // Transparent base
-  ctx.clearRect(0, 0, size, size);
-
-  const cx = size / 2;
-
-  // Forehead wrinkles (horizontal lines in upper third)
-  ctx.strokeStyle = 'rgba(60, 35, 20, 0.5)';
-  ctx.lineWidth = 1.5;
-  ctx.lineCap = 'round';
-
-  for (let i = 0; i < 5; i++) {
-    const y = size * 0.12 + i * size * 0.035;
-    ctx.beginPath();
-    ctx.moveTo(cx - size * 0.2, y);
-    ctx.quadraticCurveTo(cx, y - 2 + Math.sin(i) * 3, cx + size * 0.2, y);
-    ctx.stroke();
-  }
-
-  // Crow's feet (left eye area)
-  for (let side = -1; side <= 1; side += 2) {
-    const ex = cx + side * size * 0.22;
-    const ey = size * 0.38;
-    ctx.lineWidth = 1.2;
-    for (let j = -2; j <= 2; j++) {
-      ctx.beginPath();
-      ctx.moveTo(ex, ey);
-      ctx.lineTo(ex + side * size * 0.06, ey + j * size * 0.02);
-      ctx.stroke();
-    }
-  }
-
-  // Nasolabial folds
-  ctx.lineWidth = 1.8;
-  ctx.strokeStyle = 'rgba(60, 35, 20, 0.4)';
-  for (let side = -1; side <= 1; side += 2) {
-    const sx = cx + side * size * 0.1;
-    ctx.beginPath();
-    ctx.moveTo(sx, size * 0.45);
-    ctx.quadraticCurveTo(sx + side * size * 0.02, size * 0.55, sx - side * size * 0.01, size * 0.65);
-    ctx.stroke();
-  }
-
-  // Under-eye creases
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = 'rgba(80, 50, 35, 0.35)';
-  for (let side = -1; side <= 1; side += 2) {
-    const ux = cx + side * size * 0.12;
-    const uy = size * 0.42;
-    ctx.beginPath();
-    ctx.moveTo(ux - size * 0.05, uy);
-    ctx.quadraticCurveTo(ux, uy + size * 0.015, ux + size * 0.05, uy);
-    ctx.stroke();
-  }
-
-  // Lip lines (vertical above upper lip)
-  ctx.lineWidth = 0.8;
-  ctx.strokeStyle = 'rgba(60, 35, 20, 0.3)';
-  for (let i = -3; i <= 3; i++) {
-    const lx = cx + i * size * 0.02;
-    ctx.beginPath();
-    ctx.moveTo(lx, size * 0.62);
-    ctx.lineTo(lx + (i > 0 ? 1 : -1), size * 0.66);
-    ctx.stroke();
-  }
-
-  // Age spots (scattered)
-  ctx.fillStyle = 'rgba(100, 60, 30, 0.15)';
-  const spots = [
-    [0.35, 0.2, 4], [0.62, 0.18, 3], [0.28, 0.35, 2.5],
-    [0.7, 0.33, 3], [0.4, 0.55, 2], [0.58, 0.48, 2.5],
-    [0.32, 0.15, 3.5], [0.65, 0.25, 2],
-  ];
-  for (const [rx, ry, r] of spots) {
-    ctx.beginPath();
-    ctx.arc(size * rx, size * ry, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.needsUpdate = true;
-  return texture;
+interface FaceState {
+  detected: boolean;
+  x: number;
+  y: number;
+  s: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  expressions: number[];
 }
 
-// Custom shader for face aging overlay
-const agingVertexShader = `
-  varying vec2 vUv;
-  void main() {
-    vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-  }
-`;
-
-const agingFragmentShader = `
-  uniform sampler2D wrinkleMap;
-  uniform float intensity;
-  uniform float skinDesaturation;
-  uniform float skinWarmth;
-  varying vec2 vUv;
-
-  void main() {
-    vec4 wrinkle = texture2D(wrinkleMap, vUv);
-
-    // Wrinkle overlay with intensity control
-    float wrinkleAlpha = wrinkle.a * intensity;
-
-    // Skin aging color (warm, desaturated)
-    vec3 agingTint = vec3(0.35, 0.25, 0.18);
-
-    // Combine wrinkle detail with skin tint
-    vec3 color = mix(agingTint, wrinkle.rgb, 0.6);
-
-    gl_FragColor = vec4(color, wrinkleAlpha);
-  }
-`;
-
 export default function WebcamAging() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraThreeRef = useRef<THREE.OrthographicCamera | null>(null);
-  const faceMeshRef = useRef<THREE.Mesh | null>(null);
-  const animFrameRef = useRef<number>(0);
+  const faceCanvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const faceFilterRef = useRef<any>(null);
-  const streamRef = useRef<MediaStream | null>(null);
+  const faceStateRef = useRef<FaceState>({
+    detected: false, x: 0, y: 0, s: 0, rx: 0, ry: 0, rz: 0, expressions: [],
+  });
 
   const [cameraOn, setCameraOn] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -164,64 +49,157 @@ export default function WebcamAging() {
   useEffect(() => { showWrinklesRef.current = showWrinkles; }, [showWrinkles]);
   useEffect(() => { showSkinAgingRef.current = showSkinAging; }, [showSkinAging]);
 
+  const drawAgingOverlay = useCallback(() => {
+    const overlay = overlayCanvasRef.current;
+    const faceCanvas = faceCanvasRef.current;
+    if (!overlay || !faceCanvas) return;
+
+    const ctx = overlay.getContext('2d');
+    if (!ctx) return;
+
+    const W = faceCanvas.width;
+    const H = faceCanvas.height;
+    overlay.width = W;
+    overlay.height = H;
+    ctx.clearRect(0, 0, W, H);
+
+    const face = faceStateRef.current;
+    if (!face.detected) return;
+
+    const factor = ageIntensityRef.current / 100;
+    if (factor === 0) return;
+
+    // Convert facefilter coordinates (-1..1) to canvas pixels
+    const cx = (face.x + 1) * 0.5 * W;
+    const cy = (1 - (face.y + 1) * 0.5) * H;
+    const faceSize = face.s * W * 0.6;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(-face.rz);
+
+    // Skin aging: semi-transparent warm overlay on face region
+    if (showSkinAgingRef.current) {
+      const grad = ctx.createRadialGradient(0, 0, faceSize * 0.1, 0, 0, faceSize);
+      grad.addColorStop(0, `rgba(120, 80, 50, ${factor * 0.15})`);
+      grad.addColorStop(0.7, `rgba(100, 70, 45, ${factor * 0.1})`);
+      grad.addColorStop(1, 'rgba(100, 70, 45, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(0, faceSize * 0.05, faceSize, faceSize * 1.3, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    if (showWrinklesRef.current) {
+      const alpha = Math.min(factor * 0.8, 0.7);
+      const lw = 1 + factor * 1.5;
+
+      // Forehead wrinkles
+      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha})`;
+      ctx.lineWidth = lw;
+      ctx.lineCap = 'round';
+
+      for (let i = 0; i < 4; i++) {
+        const y = -faceSize * (0.6 + i * 0.08);
+        const spread = faceSize * (0.35 - i * 0.03);
+        ctx.beginPath();
+        ctx.moveTo(-spread, y);
+        ctx.quadraticCurveTo(0, y - 3 + Math.sin(i * 1.5) * 2, spread, y);
+        ctx.stroke();
+      }
+
+      // Crow's feet (both sides)
+      ctx.lineWidth = lw * 0.8;
+      for (const side of [-1, 1]) {
+        const ex = side * faceSize * 0.42;
+        const ey = -faceSize * 0.15;
+        for (let j = -2; j <= 2; j++) {
+          ctx.beginPath();
+          ctx.moveTo(ex, ey);
+          ctx.lineTo(
+            ex + side * faceSize * (0.08 + factor * 0.06),
+            ey + j * faceSize * 0.04
+          );
+          ctx.stroke();
+        }
+      }
+
+      // Nasolabial folds
+      ctx.lineWidth = lw * 1.2;
+      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.8})`;
+      for (const side of [-1, 1]) {
+        const nx = side * faceSize * 0.18;
+        ctx.beginPath();
+        ctx.moveTo(nx, -faceSize * 0.05);
+        ctx.quadraticCurveTo(
+          nx + side * faceSize * 0.06,
+          faceSize * 0.15,
+          nx - side * faceSize * 0.02,
+          faceSize * 0.35
+        );
+        ctx.stroke();
+      }
+
+      // Under-eye bags
+      ctx.lineWidth = lw * 0.7;
+      ctx.strokeStyle = `rgba(90, 55, 35, ${alpha * 0.5})`;
+      for (const side of [-1, 1]) {
+        const ux = side * faceSize * 0.2;
+        const uy = -faceSize * 0.08;
+        ctx.beginPath();
+        ctx.moveTo(ux - faceSize * 0.1, uy);
+        ctx.quadraticCurveTo(ux, uy + faceSize * 0.04, ux + faceSize * 0.1, uy);
+        ctx.stroke();
+      }
+
+      // Lip lines
+      ctx.lineWidth = lw * 0.5;
+      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.4})`;
+      for (let i = -3; i <= 3; i++) {
+        const lx = i * faceSize * 0.04;
+        ctx.beginPath();
+        ctx.moveTo(lx, faceSize * 0.25);
+        ctx.lineTo(lx + (i > 0 ? 1.5 : -1.5), faceSize * 0.32);
+        ctx.stroke();
+      }
+
+      // Age spots
+      ctx.fillStyle = `rgba(100, 65, 35, ${alpha * 0.25})`;
+      const spots = [
+        [-0.25, -0.5, 3], [0.2, -0.55, 2.5], [-0.15, -0.3, 2],
+        [0.3, -0.4, 3.5], [-0.3, 0.1, 2], [0.25, 0.05, 2.5],
+        [0.35, -0.2, 2], [-0.35, -0.45, 3],
+      ];
+      for (const [rx, ry, r] of spots) {
+        ctx.beginPath();
+        ctx.arc(rx * faceSize, ry * faceSize, r * (0.5 + factor * 0.5), 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Forehead creases (vertical between brows)
+      ctx.strokeStyle = `rgba(70, 40, 25, ${alpha * 0.6})`;
+      ctx.lineWidth = lw;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(side * faceSize * 0.06, -faceSize * 0.45);
+        ctx.lineTo(side * faceSize * 0.05, -faceSize * 0.55);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+  }, []);
+
   const startCamera = useCallback(async () => {
     setLoading(true);
     setError(null);
 
     try {
-      // Dynamically import facefilter
       const { JEELIZFACEFILTER, NN_4EXPR } = await import('facefilter');
 
-      // Create canvas if needed
-      let canvas = canvasRef.current;
-      if (!canvas) {
-        setError('Canvas not ready');
-        setLoading(false);
-        return;
-      }
+      const canvas = faceCanvasRef.current;
+      if (!canvas) throw new Error('Canvas not ready');
 
-      const W = 640;
-      const H = 480;
-      canvas.width = W;
-      canvas.height = H;
-
-      // Setup Three.js scene
-      const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
-      renderer.setSize(W, H);
-      renderer.autoClear = false;
-      rendererRef.current = renderer;
-
-      const scene = new THREE.Scene();
-      sceneRef.current = scene;
-
-      const cam = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0.1, 100);
-      cam.position.z = 1;
-      cameraThreeRef.current = cam;
-
-      // Create wrinkle texture
-      const wrinkleTexture = createWrinkleTexture(512);
-
-      // Face overlay mesh — a plane that tracks the face
-      const agingMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-          wrinkleMap: { value: wrinkleTexture },
-          intensity: { value: 0.6 },
-          skinDesaturation: { value: 0.3 },
-          skinWarmth: { value: 0.2 },
-        },
-        vertexShader: agingVertexShader,
-        fragmentShader: agingFragmentShader,
-        transparent: true,
-        depthTest: false,
-      });
-
-      const faceGeo = new THREE.PlaneGeometry(1, 1);
-      const faceMesh = new THREE.Mesh(faceGeo, agingMaterial);
-      faceMesh.visible = false;
-      scene.add(faceMesh);
-      faceMeshRef.current = faceMesh;
-
-      // Initialize facefilter
       faceFilterRef.current = JEELIZFACEFILTER;
 
       await new Promise<void>((resolve, reject) => {
@@ -233,49 +211,26 @@ export default function WebcamAging() {
 
           callbackReady: (errCode: any) => {
             if (errCode) {
-              reject(new Error(`FaceFilter init error: ${errCode}`));
+              reject(new Error(`FaceFilter error: ${errCode}`));
               return;
             }
             resolve();
           },
 
-          callbackTrack: (detectState: any) => {
-            const mesh = faceMeshRef.current;
-            if (!mesh) return;
-            const material = mesh.material as THREE.ShaderMaterial;
+          callbackTrack: (state: any) => {
+            faceStateRef.current = {
+              detected: state.detected > 0.5,
+              x: state.x,
+              y: state.y,
+              s: state.s,
+              rx: state.rx,
+              ry: state.ry,
+              rz: state.rz,
+              expressions: state.expressions ? [...state.expressions] : [],
+            };
 
-            if (detectState.detected > 0.5) {
-              mesh.visible = true;
-
-              // Position and scale the overlay to match the face
-              const s = detectState.s * 1.2;
-              mesh.scale.set(s, s * 1.3, 1);
-              mesh.position.set(
-                detectState.x * 0.5,
-                detectState.y * 0.5 + s * 0.1,
-                0
-              );
-              mesh.rotation.z = -detectState.rz;
-
-              // Update shader uniforms
-              const factor = ageIntensityRef.current / 100;
-              material.uniforms.intensity.value = showWrinklesRef.current ? factor : 0;
-              material.uniforms.skinDesaturation.value = showSkinAgingRef.current ? factor * 0.4 : 0;
-              material.uniforms.skinWarmth.value = showSkinAgingRef.current ? factor * 0.25 : 0;
-            } else {
-              mesh.visible = false;
-            }
-
-            // Render
-            const r = rendererRef.current;
-            const c = cameraThreeRef.current;
-            const sc = sceneRef.current;
-            if (r && c && sc) {
-              r.clear();
-              // FaceFilter already drew the video feed to the canvas via WebGL
-              // We render our Three.js overlay on top
-              r.render(sc, c);
-            }
+            // Draw aging overlay on the second canvas
+            drawAgingOverlay();
           },
         });
       });
@@ -286,34 +241,36 @@ export default function WebcamAging() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [drawAgingOverlay]);
 
   const stopCamera = useCallback(() => {
-    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     try {
       faceFilterRef.current?.destroy();
     } catch {}
     faceFilterRef.current = null;
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    streamRef.current = null;
-    rendererRef.current?.dispose();
-    rendererRef.current = null;
     setCameraOn(false);
   }, []);
 
   useEffect(() => {
     return () => {
       try { faceFilterRef.current?.destroy(); } catch {}
-      streamRef.current?.getTracks().forEach(t => t.stop());
-      rendererRef.current?.dispose();
     };
   }, []);
 
   const handleCapture = () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const faceCanvas = faceCanvasRef.current;
+    const overlay = overlayCanvasRef.current;
+    if (!faceCanvas) return;
 
-    canvas.toBlob((blob) => {
+    // Composite both canvases
+    const out = document.createElement('canvas');
+    out.width = faceCanvas.width;
+    out.height = faceCanvas.height;
+    const ctx = out.getContext('2d')!;
+    ctx.drawImage(faceCanvas, 0, 0);
+    if (overlay) ctx.drawImage(overlay, 0, 0);
+
+    out.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -359,19 +316,19 @@ export default function WebcamAging() {
                 <input type="checkbox" checked={showWrinkles} onChange={(e) => setShowWrinkles(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Wrinkles, lines & age spots</span>
-                <Tooltip text="Overlays wrinkle patterns on the forehead, around the eyes, nasolabial folds, lip lines, and scattered age spots." />
+                <Tooltip text="Overlays wrinkle patterns on the forehead, around the eyes, nasolabial folds, lip lines, age spots, and frown lines — all tracked to the face in real-time." />
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input type="checkbox" checked={showSkinAging} onChange={(e) => setShowSkinAging(e.target.checked)}
                   className="rounded border-slate-300 text-amber-500 focus:ring-amber-400" />
                 <span className="text-sm text-slate-700">Skin tone aging</span>
-                <Tooltip text="Desaturates and warms the skin tone in the face region to simulate aged skin." />
+                <Tooltip text="Applies a warm, slightly desaturated overlay to the face region to simulate aged skin tone." />
               </label>
             </div>
 
             <div className="p-3 bg-slate-50 rounded-lg">
               <p className="text-xs text-slate-500 leading-relaxed">
-                All processing runs locally in your browser using WebGL. No camera images are sent to any server.
+                All processing runs locally in your browser. No camera images are sent to any server.
               </p>
             </div>
           </div>
@@ -410,16 +367,28 @@ export default function WebcamAging() {
         </div>
 
         {/* Right: Video feed */}
-        <div className="space-y-4" ref={containerRef}>
+        <div className="space-y-4">
           <div className="bg-white rounded-2xl border border-slate-200 p-4 min-h-[400px] flex items-center justify-center overflow-hidden">
-            <canvas
-              ref={canvasRef}
-              style={{
-                maxWidth: '100%',
-                borderRadius: '0.5rem',
-                display: cameraOn ? 'block' : 'none',
-              }}
-            />
+            <div className="relative" style={{ display: cameraOn ? 'block' : 'none' }}>
+              <canvas
+                ref={faceCanvasRef}
+                width={640}
+                height={480}
+                style={{ maxWidth: '100%', borderRadius: '0.5rem' }}
+              />
+              <canvas
+                ref={overlayCanvasRef}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  height: '100%',
+                  borderRadius: '0.5rem',
+                  pointerEvents: 'none',
+                }}
+              />
+            </div>
             {!cameraOn && (
               <div className="text-center space-y-3">
                 <Camera className="w-10 h-10 mx-auto text-slate-200" />
